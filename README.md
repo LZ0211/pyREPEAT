@@ -432,11 +432,11 @@ export NUMBA_NUM_THREADS=8
 如果您在研究中使用了本软件，请引用：
 
 ```bibtex
-@software{repeat2025,
-  author = {Your Name},
-  title = {REPEAT v2.0: High-Performance Electrostatic Potential Fitting},
+@software{
+  author = {Cong Wang},
+  title = {pyREPEAT v2.0: High-Performance Electrostatic Potential Fitting},
   year = {2026},
-  url = {https://github.com/yourusername/repeat}
+  url = {[https://github.com/LZ0211/pyREPEAT](https://github.com/LZ0211/pyREPEAT)}
 }
 ```
 
