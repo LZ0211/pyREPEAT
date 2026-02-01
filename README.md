@@ -1,8 +1,8 @@
-# REPEAT v2.0 - 高性能静电势电荷拟合
+# pyREPEAT v2.0 - 高性能静电势电荷拟合
 
 > **RE**peat **P**ackage for **E**lectrostatic potential **A**tomic charges in periodic sys**T**ems
 
-REPEAT是一个用于周期性体系静电势电荷拟合的高性能科学计算软件。本版本(v2.0)进行了全面的性能优化，支持多核CPU、GPU加速以及混合精度计算，相比官方基础的C++的无CPU加速版本最高可提升**50~100倍**性能。
+pyREPEAT是一个用于周期性体系静电势电荷拟合的高性能科学计算软件。本版本(v2.0)进行了全面的性能优化，支持多核CPU、GPU加速以及混合精度计算，相比官方基础的C++的无GPU加速版本最高可提升**50~100倍**性能。
 
 ---
 
