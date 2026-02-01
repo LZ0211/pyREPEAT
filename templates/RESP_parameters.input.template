@@ -1,0 +1,37 @@
+# RESP (Restrained Electrostatic Potential) parameters for REPEAT
+# Format: Element Symbol  Restraint_Strength  Target_Charge
+#
+# Restraint_Strength: Harmonic restraint strength (a.u.)
+#                     Larger values force charges closer to target
+#                     Typical values: 0.0 - 1.0
+# Target_Charge:      Target charge value for this element (e)
+#                     Usually set to 0 for organic molecules
+#
+# Example parameters for common organic molecules
+H    0.000   0.000
+C    0.000   0.000
+N    0.000   0.000
+O    0.000   0.000
+S    0.000   0.000
+P    0.000   0.000
+F    0.000   0.000
+Cl   0.000   0.000
+Br   0.000   0.000
+I    0.000   0.000
+
+# For metal-organic frameworks (MOFs), you may want to restrain metal charges
+# Example:
+# Zn   0.100   0.000
+# Cu   0.100   0.000
+# Fe   0.100   0.000
+# Ni   0.100   0.000
+# Co   0.100   0.000
+
+# For strong restraining (force charges close to target):
+# H    0.500   0.000
+# C    0.500   0.000
+
+# Notes:
+# - Use "--resp-file RESP_parameters.input" to enable RESP restraints
+# - RESP restraints are applied as: A[i,i] += strength; b[i] += strength * target
+# - If both RESP and QEq files are specified, RESP takes precedence
