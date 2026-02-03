@@ -25,52 +25,6 @@ except ImportError:
 PI = np.pi
 BOHR_TO_ANG = 0.529177
 
-# -------------------- Performance Monitoring --------------------
-class PerformanceMonitor:
-    """Simple performance monitor for tracking execution time and memory usage."""
-    
-    def __init__(self, enabled=True):
-        self.enabled = enabled
-        self.timings = {}
-        self.start_times = {}
-        
-    def start(self, name):
-        """Start timing a section."""
-        if self.enabled:
-            self.start_times[name] = time.time()
-    
-    def end(self, name):
-        """End timing a section and record duration."""
-        if self.enabled and name in self.start_times:
-            duration = time.time() - self.start_times[name]
-            if name not in self.timings:
-                self.timings[name] = []
-            self.timings[name].append(duration)
-            return duration
-        return 0.0
-    
-    def report(self):
-        """Print performance report."""
-        if not self.enabled or not self.timings:
-            return
-            
-        print("\n" + "="*60)
-        print("Performance Report")
-        print("="*60)
-        print(f"{'Section':<30} {'Total (s)':<12} {'Avg (s)':<12} {'Calls':<8}")
-        print("-"*60)
-        
-        for name in sorted(self.timings.keys()):
-            times = self.timings[name]
-            total = sum(times)
-            avg = total / len(times)
-            print(f"{name:<30} {total:<12.3f} {avg:<12.3f} {len(times):<8}")
-        
-        print("="*60)
-
-
-# Global performance monitor
-_perf_monitor = PerformanceMonitor(enabled=os.environ.get('REPEAT_PERF', '0') == '1')
 
 # -------------------- Parallel Strategy Selection --------------------
 # Thresholds for choosing parallel strategy
@@ -85,141 +39,6 @@ _GPU_CONFIG = {
     'devices': [0],  # Default to GPU 0
     'use_mixed_precision': False,  # fp32 for speed, fp64 for accuracy
 }
-
-def parse_gpu_devices(gpu_arg):
-    """Parse GPU device IDs from command line argument.
-    
-    Args:
-        gpu_arg: None, '0', '0,1,2', or 'all'
-    
-    Returns:
-        list: List of GPU device IDs
-    """
-    if gpu_arg is None or gpu_arg == '':
-        return [0] if _GPU_INFO['device_count'] > 0 else []
-    
-    if gpu_arg.lower() == 'all':
-        return list(range(_GPU_INFO['device_count']))
-    
-    try:
-        devices = [int(x.strip()) for x in str(gpu_arg).split(',')]
-        # Validate devices
-        valid_devices = [d for d in devices if 0 <= d < _GPU_INFO['device_count']]
-        if len(valid_devices) != len(devices):
-            invalid = set(devices) - set(valid_devices)
-            print(f"Warning: Invalid GPU IDs {invalid}, using {valid_devices}")
-        return valid_devices if valid_devices else [0]
-    except ValueError:
-        print(f"Warning: Invalid GPU argument '{gpu_arg}', using GPU 0")
-        return [0]
-
-def set_gpu_config(enabled=True, devices=None, mixed_precision=False):
-    """Configure GPU acceleration.
-    
-    Args:
-        enabled: Whether to enable GPU
-        devices: List of GPU device IDs or None for auto
-        mixed_precision: Whether to use fp32 (faster) instead of fp64
-    """
-    global _GPU_CONFIG
-    
-    if not _GPU_INFO['available']:
-        _GPU_CONFIG['enabled'] = False
-        return False
-    
-    _GPU_CONFIG['enabled'] = enabled
-    
-    if devices is not None:
-        _GPU_CONFIG['devices'] = devices
-    else:
-        _GPU_CONFIG['devices'] = [0]
-    
-    _GPU_CONFIG['use_mixed_precision'] = mixed_precision
-    
-    if enabled:
-        device_info = []
-        total_mem = 0
-        for d in _GPU_CONFIG['devices']:
-            if _GPU_INFO['cupy_available']:
-                import cupy as cp
-                with cp.cuda.Device(d):
-                    props = cp.cuda.runtime.getDeviceProperties(d)
-                    name = props['name'].decode('utf-8')
-                    # Get memory info for this device
-                    free_mem, total_mem_gb = cp.cuda.Device(d).mem_info
-                    total_mem_gb = total_mem_gb / (1024**3)
-                    free_mem_gb = free_mem / (1024**3)
-                    device_info.append(f"GPU{d}:{name} ({free_mem_gb:.1f}GB/{total_mem_gb:.1f}GB free)")
-                    total_mem += free_mem
-            else:
-                device_info.append(f"GPU{d}")
-        
-        precision = "mixed (fp32)" if mixed_precision else "fp64"
-        print(f"GPU acceleration enabled: {', '.join(device_info)}")
-        print(f"  Devices: {_GPU_CONFIG['devices']}")
-        print(f"  Precision: {precision}")
-        if total_mem > 0:
-            print(f"  Total available GPU memory: {total_mem / (1024**3):.1f} GB")
-    
-    return True
-
-def select_parallel_strategy(n_grid, n_atoms, use_jit=True, force_strategy=None, prefer_gpu=None):
-    """
-    Select optimal parallel strategy based on system size and available backends.
-    
-    Strategies (in order of preference):
-    1. 'gpu' - GPU acceleration (CuPy/PyTorch) - supports multi-GPU
-    2. 'numba_parallel' - Numba prange (single process, internal parallelism)
-    3. 'nogil_threads' - noGIL Python threading (shared memory, no serialization)
-    4. 'multiprocess' - Standard multiprocessing (process isolation)
-    5. 'sequential' - Single-threaded (fallback)
-    
-    Args:
-        n_grid: Number of grid points
-        n_atoms: Number of atoms
-        use_jit: Whether JIT is available
-        force_strategy: Force specific strategy (for testing)
-        prefer_gpu: Whether to prefer GPU (if None, uses global _GPU_CONFIG['enabled'])
-        
-    Returns:
-        tuple: (strategy_name, n_cores, use_parallel_jit, n_gpus)
-    """
-    # Determine if GPU should be used
-    use_gpu = prefer_gpu if prefer_gpu is not None else _GPU_CONFIG['enabled']
-    
-    if force_strategy:
-        if force_strategy == 'gpu':
-            n_gpus = len(_GPU_CONFIG['devices']) if _GPU_CONFIG['enabled'] else 1
-            return 'gpu', 1, False, n_gpus
-        elif force_strategy == 'numba_parallel':
-            return 'numba_parallel', 1, True, 0
-        elif force_strategy == 'nogil_threads':
-            return 'nogil_threads', _get_optimal_workers(), use_jit and _JIT_OK, 0
-        elif force_strategy == 'multiprocess':
-            return 'multiprocess', _get_optimal_workers(), use_jit and _JIT_OK, 0
-        elif force_strategy == 'sequential':
-            return 'sequential', 1, use_jit and _JIT_OK, 0
-    
-    # Check GPU availability and size threshold
-    if use_gpu and _GPU_INFO['available'] and n_grid >= PARALLEL_STRATEGY_THRESHOLDS['gpu_min_grid']:
-        n_gpus = len(_GPU_CONFIG['devices'])
-        return 'gpu', 1, False, n_gpus
-    
-    # Check Numba parallel for large grids
-    if use_jit and _JIT_PARALLEL_OK and n_grid >= PARALLEL_STRATEGY_THRESHOLDS['numba_parallel_min_grid']:
-        return 'numba_parallel', 1, True, 0
-    
-    # Check if work is too small for any parallelism
-    total_work = n_grid * n_atoms
-    if total_work < 1e5:  # Only skip parallelism for very small systems
-        return 'sequential', 1, use_jit and _JIT_OK, 0
-    
-    # noGIL Python: use threading instead of multiprocessing (shared memory advantage)
-    if _NOGIL_ENABLED:
-        return 'nogil_threads', _get_optimal_workers(), use_jit and _JIT_OK, 0
-    
-    # Standard Python: use multiprocessing for medium systems
-    return 'multiprocess', _get_optimal_workers(), use_jit and _JIT_OK, 0
 
 # -------------------- optional Numba JIT --------------------
 try:
@@ -239,7 +58,7 @@ def _detect_gpu():
         'cupy_available': False,
         'torch_available': False,
     }
-    
+
     # Try CuPy first (preferred for NumPy compatibility)
     try:
         import cupy as cp
@@ -253,7 +72,7 @@ def _detect_gpu():
                 gpu_info['device_name'] = props['name'].decode('utf-8')
     except Exception:
         pass
-    
+
     # Try PyTorch as fallback
     if not gpu_info['available']:
         try:
@@ -265,10 +84,86 @@ def _detect_gpu():
                 gpu_info['device_name'] = torch.cuda.get_device_name(0)
         except Exception:
             pass
-    
+
     return gpu_info
 
 _GPU_INFO = _detect_gpu()
+
+def parse_gpu_devices(gpu_arg):
+    """Parse GPU device IDs from command line argument.
+
+    Args:
+        gpu_arg: None, '0', '0,1,2', or 'all'
+
+    Returns:
+        list: List of GPU device IDs
+    """
+    if gpu_arg is None or gpu_arg == '':
+        return [0] if _GPU_INFO['device_count'] > 0 else []
+
+    if gpu_arg.lower() == 'all':
+        return list(range(_GPU_INFO['device_count']))
+
+    try:
+        devices = [int(x.strip()) for x in str(gpu_arg).split(',')]
+        # Validate devices
+        valid_devices = [d for d in devices if 0 <= d < _GPU_INFO['device_count']]
+        if len(valid_devices) != len(devices):
+            invalid = set(devices) - set(valid_devices)
+            print(f"Warning: Invalid GPU IDs {invalid}, using {valid_devices}")
+        return valid_devices if valid_devices else ([0] if _GPU_INFO['device_count'] > 0 else [])
+    except ValueError:
+        print(f"Warning: Invalid GPU argument '{gpu_arg}', using GPU 0")
+        return [0] if _GPU_INFO['device_count'] > 0 else []
+
+def set_gpu_config(enabled=True, devices=None, mixed_precision=False):
+    """Configure GPU acceleration.
+
+    Args:
+        enabled: Whether to enable GPU
+        devices: List of GPU device IDs or None for auto
+        mixed_precision: Whether to use fp32 (faster) instead of fp64
+    """
+    global _GPU_CONFIG
+
+    if not _GPU_INFO['available']:
+        _GPU_CONFIG['enabled'] = False
+        return False
+
+    _GPU_CONFIG['enabled'] = enabled
+
+    if devices is not None:
+        _GPU_CONFIG['devices'] = devices
+    else:
+        _GPU_CONFIG['devices'] = [0]
+
+    _GPU_CONFIG['use_mixed_precision'] = mixed_precision
+
+    if enabled:
+        device_info = []
+        total_mem = 0
+        for d in _GPU_CONFIG['devices']:
+            if _GPU_INFO['cupy_available']:
+                import cupy as cp
+                with cp.cuda.Device(d):
+                    props = cp.cuda.runtime.getDeviceProperties(d)
+                    name = props['name'].decode('utf-8')
+                    free_mem, total_mem_gb = cp.cuda.Device(d).mem_info
+                    total_mem_gb = total_mem_gb / (1024**3)
+                    free_mem_gb = free_mem / (1024**3)
+                    device_info.append(f"GPU{d}:{name} ({free_mem_gb:.1f}GB/{total_mem_gb:.1f}GB free)")
+                    total_mem += free_mem
+            else:
+                device_info.append(f"GPU{d}")
+
+        precision = "mixed (fp32)" if mixed_precision else "fp64"
+        print(f"GPU acceleration enabled: {', '.join(device_info)}")
+        print(f"  Devices: {_GPU_CONFIG['devices']}")
+        print(f"  Precision: {precision}")
+        if total_mem > 0:
+            print(f"  Total available GPU memory: {total_mem / (1024**3):.1f} GB")
+
+    return True
 
 # -------------------- noGIL Detection --------------------
 def _is_nogil():
@@ -277,12 +172,11 @@ def _is_nogil():
         # Method 1: Check sys.flags for nogil flag (Python 3.13+)
         if hasattr(sys.flags, 'nogil') and sys.flags.nogil:
             return True
-        
+
         # Method 2: Check if threading can run without GIL
-        # In noGIL Python, we can check the _is_gil_enabled function
         if hasattr(sys, '_is_gil_enabled'):
             return not sys._is_gil_enabled()
-        
+
         # Method 3: Try to import experimental nogil features
         try:
             import sysconfig
@@ -291,90 +185,102 @@ def _is_nogil():
                 return bool(config_vars['Py_GIL_DISABLED'])
         except:
             pass
-            
+
     except Exception:
         pass
     return False
 
 _NOGIL_ENABLED = _is_nogil()
 
+# -------------------- Threading / BLAS oversubscription control --------------------
+def _maybe_limit_blas_threads(enable=True):
+    """
+    Avoid nested parallelism: outer ThreadPool/ProcessPool + BLAS threads can oversubscribe.
+    If REPEAT_LIMIT_BLAS=0, do nothing.
+    """
+    if not enable:
+        return
+    if os.environ.get("REPEAT_LIMIT_BLAS", "1") == "0":
+        return
+    # Set only if not explicitly set by user
+    for k in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "VECLIB_MAXIMUM_THREADS", "NUMEXPR_NUM_THREADS"):
+        os.environ.setdefault(k, "1")
+    # Try numba thread limit if available
+    try:
+        import numba
+        if hasattr(numba, "set_num_threads"):
+            # Keep as 1 by default when outer parallelism exists
+            numba.set_num_threads(1)
+    except Exception:
+        pass
+
 # -------------------- Parallel Backend Selection --------------------
 def _pick_parallel_backend(prefer_threads=None):
     """
     Select optimal parallel backend based on Python GIL status.
-    
+
     Returns:
-        tuple: (executor_class, use_threads, context)
-        - executor_class: ThreadPoolExecutor or ProcessPoolExecutor
+        tuple: (use_threads, mp_context)
         - use_threads: bool indicating if using thread-based parallelism
-        - context: multiprocessing context (for process-based)
+        - mp_context: multiprocessing context (for process-based) or None
     """
     if prefer_threads is None:
-        # Auto-detect: use threads if noGIL is enabled
         prefer_threads = _NOGIL_ENABLED
-    
-    if prefer_threads:
-        # Use ThreadPoolExecutor for noGIL Python
-        return ThreadPoolExecutor, True, None
-    else:
-        # Use ProcessPoolExecutor for standard Python
-        from multiprocessing import get_context
-        try:
-            if sys.platform.startswith("linux"):
-                ctx = get_context("forkserver")
-            else:
-                ctx = get_context("spawn")
-        except Exception:
-            ctx = get_context("spawn")
-        
-        # Return a wrapper that uses the context
-        def ContextPoolExecutor(max_workers=None):
-            return ctx.Pool(processes=max_workers)
-        
-        return ContextPoolExecutor, False, ctx
 
+    if prefer_threads:
+        return True, None
+
+    from multiprocessing import get_context
+    try:
+        if sys.platform.startswith("linux"):
+            ctx = get_context("forkserver")
+        else:
+            ctx = get_context("spawn")
+    except Exception:
+        ctx = get_context("spawn")
+    return False, ctx
+
+def _get_physical_or_logical_cpu_count():
+    """
+    Prefer physical cores if available (psutil), fallback to logical cores.
+    This keeps your original 'physical core' intent but avoids cpu_count//2 guess.
+    """
+    if psutil is not None:
+        try:
+            phys = psutil.cpu_count(logical=False)
+            if phys is not None and phys > 0:
+                return int(phys)
+        except Exception:
+            pass
+    cpu = os.cpu_count()
+    return int(cpu) if cpu is not None else 4
 
 def _get_optimal_workers(n_cores_requested=None, reserve_fraction=0.1):
     """
     Determine optimal number of workers based on system and workload.
-    
-    For noGIL: Can use more threads since no GIL contention
-    For standard Python: Reserve some cores for system processes
+
+    - Prefer physical cores if psutil exists.
+    - noGIL: threads scale better; reserve a small fraction.
+    - GIL: reserve some cores for system.
     """
-    cpu_count = os.cpu_count()
-    if cpu_count is None:
-        cpu_count = 4
-    
-    total_cpus = max(1, cpu_count)
-    
+    total_cpus = max(1, _get_physical_or_logical_cpu_count())
+
     if n_cores_requested is not None:
         return max(1, min(int(n_cores_requested), total_cpus))
-    
+
     if _NOGIL_ENABLED:
-        # In noGIL mode, we can use all cores efficiently
-        # Reserve only a small fraction for system
         return max(1, int(total_cpus * (1 - reserve_fraction)))
     else:
-        # Standard Python with GIL - use most cores
-        # Only reserve 1 core for system on small systems
         if total_cpus <= 2:
             return total_cpus
         elif total_cpus <= 4:
             return max(1, total_cpus - 1)
         else:
-            # Use 90% of cores for large systems
             return max(1, int(total_cpus * 0.9))
 
-# -------------------- utility functions --------------------
-
 def determine_optimal_cores(n_atoms=None, n_grid=None, n_cores_requested=None, reserve_fraction=0.25):
-    """确定最佳 CPU 核心数。"""
-    # Handle None from os.cpu_count()
-    cpu_count = os.cpu_count()
-    if cpu_count is None:
-        cpu_count = 4  # Default fallback
-    
-    total_cpus = max(1, cpu_count // 2)
+    """确定最佳 CPU 核心数（物理核优先）。"""
+    total_cpus = max(1, _get_physical_or_logical_cpu_count())
     if n_cores_requested is not None:
         return max(1, min(int(n_cores_requested), total_cpus))
 
@@ -389,6 +295,53 @@ def determine_optimal_cores(n_atoms=None, n_grid=None, n_cores_requested=None, r
         elif work_per_core < 1e7:
             return max(1, min(16, max_cores // 2))
     return max(1, max_cores)
+
+def select_parallel_strategy(n_grid, n_atoms, use_jit=True, force_strategy=None, prefer_gpu=None):
+    """
+    Select optimal parallel strategy based on system size and available backends.
+
+    Strategies (in order of preference):
+    1. 'gpu' - GPU acceleration (CuPy/PyTorch) - supports multi-GPU
+    2. 'numba_parallel' - Numba prange (single process, internal parallelism)
+    3. 'nogil_threads' - noGIL Python threading (shared memory, no serialization)
+    4. 'multiprocess' - Standard multiprocessing (process isolation)
+    5. 'sequential' - Single-threaded (fallback)
+
+    Returns:
+        tuple: (strategy_name, n_cores, use_parallel_jit, n_gpus)
+    """
+    use_gpu = prefer_gpu if prefer_gpu is not None else _GPU_CONFIG['enabled']
+
+    if force_strategy:
+        if force_strategy == 'gpu':
+            n_gpus = len(_GPU_CONFIG['devices']) if _GPU_CONFIG['enabled'] else 0
+            return 'gpu', 1, False, n_gpus
+        elif force_strategy == 'numba_parallel':
+            return 'numba_parallel', 1, True, 0
+        elif force_strategy == 'nogil_threads':
+            return 'nogil_threads', _get_optimal_workers(), use_jit and _JIT_OK, 0
+        elif force_strategy == 'multiprocess':
+            return 'multiprocess', _get_optimal_workers(), use_jit and _JIT_OK, 0
+        elif force_strategy == 'sequential':
+            return 'sequential', 1, use_jit and _JIT_OK, 0
+
+    if use_gpu and _GPU_INFO['available'] and n_grid >= PARALLEL_STRATEGY_THRESHOLDS['gpu_min_grid']:
+        n_gpus = len(_GPU_CONFIG['devices'])
+        return 'gpu', 1, False, n_gpus
+
+    if use_jit and _JIT_PARALLEL_OK and n_grid >= PARALLEL_STRATEGY_THRESHOLDS['numba_parallel_min_grid']:
+        return 'numba_parallel', 1, True, 0
+
+    total_work = n_grid * n_atoms
+    if total_work < 1e5:
+        return 'sequential', 1, use_jit and _JIT_OK, 0
+
+    if _NOGIL_ENABLED:
+        return 'nogil_threads', _get_optimal_workers(), use_jit and _JIT_OK, 0
+
+    return 'multiprocess', _get_optimal_workers(), use_jit and _JIT_OK, 0
+
+# -------------------- constants --------------------
 
 VDW_RADII = np.array([
     2.72687, 2.23177, 2.31586, 2.59365, 3.85788, 3.63867, 3.45820, 3.30702,
@@ -479,7 +432,6 @@ DEFAULT_QEQ_PARAMS = {
 }
 
 # -------------------- memory-safe compute helpers --------------------
-
 def _make_neighbor_shifts_27(box_vectors: np.ndarray) -> np.ndarray:
     shifts = []
     for kz in (-1, 0, 1):
@@ -499,6 +451,7 @@ def _make_realspace_shifts(nmax: np.ndarray, box_vectors: np.ndarray) -> np.ndar
 
 # ---- optional JIT kernels (probe + safe fallback) ----
 _JIT_OK = False
+_JIT_PARALLEL_OK = False
 if _NUMBA_AVAILABLE:
     try:
         import math
@@ -547,27 +500,23 @@ if _NUMBA_AVAILABLE:
                         phi_real[i] += math.erfc(sqrt_alpha * r) / r
             return phi_real
 
-        # Probe compile (disable JIT if erfc unsupported)
         _probe_grid = np.zeros((1, 3), dtype=np.float64)
         _probe_atom = np.zeros(3, dtype=np.float64)
         _probe_shifts = np.zeros((1, 3), dtype=np.float64)
         _ = _real_space_sum_jit(_probe_grid, _probe_atom, _probe_shifts, 1.0, 1.0)
         _ = _reciprocal_sum_blocked_jit(_probe_grid, _probe_shifts, np.zeros(1, dtype=np.float64), 1)
         _JIT_OK = True
-        
-        # Try to compile parallel versions
+
         try:
             from numba import prange
-            
+
             @njit(cache=True, fastmath=True, parallel=True)
             def _reciprocal_sum_blocked_jit_parallel(delta, kvecs, kcoefs, block_k=64):
-                """Parallel version using prange - for large grids."""
                 n_grid = delta.shape[0]
                 n_k = kvecs.shape[0]
                 phi = np.zeros(n_grid, dtype=np.float64)
                 for start in range(0, n_k, block_k):
                     end = min(start + block_k, n_k)
-                    # Parallelize over grid points
                     for i in prange(n_grid):
                         acc = 0.0
                         dx = delta[i, 0]
@@ -581,7 +530,6 @@ if _NUMBA_AVAILABLE:
 
             @njit(cache=True, fastmath=True, parallel=True)
             def _real_space_sum_jit_parallel(grid_pos, atom_pos, shifts, R_cutoff, sqrt_alpha):
-                """Parallel version using prange - for large grids."""
                 n_grid = grid_pos.shape[0]
                 phi_real = np.zeros(n_grid, dtype=np.float64)
                 R2 = R_cutoff * R_cutoff
@@ -594,7 +542,6 @@ if _NUMBA_AVAILABLE:
                     img2 = atom_pos[2] + sh2
 
                     is_self = (sh0 == 0.0 and sh1 == 0.0 and sh2 == 0.0)
-                    # Parallelize over grid points
                     for i in prange(n_grid):
                         dx = grid_pos[i, 0] - img0
                         dy = grid_pos[i, 1] - img1
@@ -606,8 +553,7 @@ if _NUMBA_AVAILABLE:
                             r = math.sqrt(r2)
                             phi_real[i] += math.erfc(sqrt_alpha * r) / r
                 return phi_real
-            
-            # Test parallel compilation
+
             _ = _real_space_sum_jit_parallel(_probe_grid, _probe_atom, _probe_shifts, 1.0, 1.0)
             _ = _reciprocal_sum_blocked_jit_parallel(_probe_grid, _probe_shifts, np.zeros(1, dtype=np.float64), 1)
             _JIT_PARALLEL_OK = True
@@ -622,17 +568,15 @@ def _real_space_sum(grid_pos, atom_pos, shifts, R_cutoff, sqrt_alpha, use_jit=Fa
         return _real_space_sum_jit(grid_pos, atom_pos, shifts, R_cutoff, sqrt_alpha)
 
     phi_real = np.zeros(grid_pos.shape[0], dtype=np.float64)
-    # Pre-compute zero shift index for faster checking
     zero_shift_idx = -1
     for idx, sh in enumerate(shifts):
         if sh[0] == 0.0 and sh[1] == 0.0 and sh[2] == 0.0:
             zero_shift_idx = idx
             break
-    
+
     for idx, sh in enumerate(shifts):
         img = atom_pos + sh
         d = np.linalg.norm(grid_pos - img, axis=1)
-        # Use index comparison instead of array comparison
         if idx == zero_shift_idx:
             mask = (d > 1e-10) & (d <= R_cutoff)
         else:
@@ -656,26 +600,8 @@ def _reciprocal_sum_blocked(delta, kvecs, kcoefs, block_k=64, use_jit=False):
         phi += np.cos(kr) @ kc
     return phi
 
-def compute_ewald_atom(args):
-    """
-    Worker function for Ewald potential of one atom on a set of grid points.
-    """
-    (atom_idx, atom_pos, grid_pos, kvecs, kcoefs, shifts, R_cutoff,
-     sqrt_alpha, fit_flag, block_k, use_jit) = args
-
-    delta = grid_pos - atom_pos
-
-    if fit_flag == 0:
-        dists = np.linalg.norm(delta, axis=1)
-        phi = np.where(dists > 1e-10, 1.0 / dists, 0.0)
-        return atom_idx, phi
-
-    phi_recp = _reciprocal_sum_blocked(delta, kvecs, kcoefs, block_k=block_k, use_jit=use_jit)
-    phi_real = _real_space_sum(grid_pos, atom_pos, shifts, R_cutoff, sqrt_alpha, use_jit=use_jit)
-    return atom_idx, (phi_real + phi_recp)
-
 def _compute_ewald_atom_worker(atom_idx, atom_pos, grid_pos, kvecs, kcoefs, shifts,
-                                R_cutoff, sqrt_alpha, fit_flag, block_k, use_jit):
+                              R_cutoff, sqrt_alpha, fit_flag, block_k, use_jit):
     """
     Worker function for computing Ewald potential of one atom.
     Designed to work with both threads (noGIL) and processes.
@@ -691,23 +617,288 @@ def _compute_ewald_atom_worker(atom_idx, atom_pos, grid_pos, kvecs, kcoefs, shif
     phi_real = _real_space_sum(grid_pos, atom_pos, shifts, R_cutoff, sqrt_alpha, use_jit=use_jit)
     return atom_idx, (phi_real + phi_recp)
 
-def _compute_ewald_batch_wrapper(args):
-    """
-    Batch wrapper for process-based parallelism.
-    Processes multiple atoms in one go to reduce IPC overhead.
-    """
-    (start_idx, job_batch, grid_pos, kvecs, kcoefs, shifts,
-     R_cutoff, sqrt_alpha, fit_flag, block_k, use_jit) = args
-    
-    results = []
-    for atom_idx, atom_pos in job_batch:
-        _, col = _compute_ewald_atom_worker(
-            atom_idx, atom_pos, grid_pos, kvecs, kcoefs, shifts,
-            R_cutoff, sqrt_alpha, fit_flag, block_k, use_jit
-        )
-        results.append((atom_idx, col))
-    return results
+# -------------------- Multiprocess initializer cache --------------------
+# Cache large read-only arrays in child processes to avoid pickling per-task.
+_MP_SHARED = {}
 
+def _mp_init_worker(shared):
+    global _MP_SHARED
+    _MP_SHARED = shared
+    _maybe_limit_blas_threads(enable=True)
+
+def _mp_compute_atom(atom_idx_and_pos):
+    atom_idx, atom_pos = atom_idx_and_pos
+    grid_pos = _MP_SHARED["grid_pos"]
+    kvecs = _MP_SHARED["kvecs"]
+    kcoefs = _MP_SHARED["kcoefs"]
+    shifts = _MP_SHARED["shifts"]
+    R_cutoff = _MP_SHARED["R_cutoff"]
+    sqrt_alpha = _MP_SHARED["sqrt_alpha"]
+    fit_flag = _MP_SHARED["fit_flag"]
+    block_k = _MP_SHARED["block_k"]
+    use_jit = _MP_SHARED["use_jit"]
+    return _compute_ewald_atom_worker(atom_idx, atom_pos, grid_pos, kvecs, kcoefs, shifts,
+                                     R_cutoff, sqrt_alpha, fit_flag, block_k, use_jit)
+
+def _aabb_distance_sq(min1, max1, min2, max2):
+    d2 = 0.0
+    for a0, a1, b0, b1 in ((min1[0], max1[0], min2[0], max2[0]),
+                          (min1[1], max1[1], min2[1], max2[1]),
+                          (min1[2], max1[2], min2[2], max2[2])):
+        if a1 < b0:
+            d = b0 - a1
+            d2 += d * d
+        elif b1 < a0:
+            d = a0 - b1
+            d2 += d * d
+    return d2
+
+def _prune_realspace_shifts_aabb(shifts, grid_pos=None, box_vectors=None, atom_positions=None, R_cutoff=20.0):
+    """
+    Prune real-space shifts using AABB distance test similar to CUDA version.
+    - If grid_pos is available: use its exact AABB.
+    - Else fall back to cell corners AABB (conservative).
+    """
+    shifts = np.asarray(shifts, dtype=np.float64)
+
+    if grid_pos is not None and len(grid_pos) > 0:
+        gmin = np.min(grid_pos, axis=0)
+        gmax = np.max(grid_pos, axis=0)
+    else:
+        if box_vectors is None:
+            return shifts
+        axis = np.asarray(box_vectors, dtype=np.float64)
+        corners = np.array(list(itertools.product([0.0, 1.0], repeat=3)), dtype=np.float64) @ axis
+        gmin = corners.min(axis=0)
+        gmax = corners.max(axis=0)
+
+    if atom_positions is None or len(atom_positions) == 0:
+        return shifts
+    apos = np.asarray(atom_positions, dtype=np.float64)
+    amin = np.min(apos, axis=0)
+    amax = np.max(apos, axis=0)
+
+    R2 = float(R_cutoff) * float(R_cutoff)
+    kept = []
+    for sh in shifts:
+        smin = amin + sh
+        smax = amax + sh
+        if _aabb_distance_sq(gmin, gmax, smin, smax) <= R2:
+            kept.append(sh)
+    if len(kept) == 0:
+        kept = [np.zeros(3, dtype=np.float64)]
+    return np.asarray(kept, dtype=np.float64)
+
+# -------------------- Bins build + GPU bins filter (kept) --------------------
+def _build_effective_atoms_and_bins(atom_pos_base, box_vectors, vdw_radii, vdw_rmax, axis, origin=None):
+    """
+    Build effective atoms (27 neighbor images clipped by AABB) and bin CSR.
+    Returns:
+      eff_x, eff_y, eff_z: float64 arrays (A)
+      eff_rmin2, eff_rmax2: float64 arrays (A)
+      bin_min: float64[3]
+      bin_size: float64
+      bnx,bny,bnz: int
+      offsets: int32[nbins+1]
+      indices: int32[A]
+    """
+    atom_pos_base = np.asarray(atom_pos_base, dtype=np.float64)
+    vdw_radii = np.asarray(vdw_radii, dtype=np.float64)
+    vdw_rmax = np.asarray(vdw_rmax, dtype=np.float64)
+    box_vectors = np.asarray(box_vectors, dtype=np.float64)
+
+    neigh_shifts = _make_neighbor_shifts_27(box_vectors)
+
+    corners_iter = itertools.product([0, 1], repeat=3)
+    box_corners = np.dot(np.array(list(corners_iter), dtype=np.float64), axis)
+    box_min = np.min(box_corners, axis=0)
+    box_max = np.max(box_corners, axis=0)
+
+    global_max_r = float(np.max(vdw_rmax)) if len(vdw_rmax) else 5.0
+    safe_margin = global_max_r + 0.1
+    limit_min = box_min - safe_margin
+    limit_max = box_max + safe_margin
+
+    all_atoms_pos = (atom_pos_base[:, None, :] + neigh_shifts[None, :, :]).reshape(-1, 3)
+    all_rmin2 = np.repeat(vdw_radii * vdw_radii, len(neigh_shifts))
+    all_rmax2 = np.repeat(vdw_rmax * vdw_rmax, len(neigh_shifts))
+
+    inb = (
+        (all_atoms_pos[:, 0] >= limit_min[0]) & (all_atoms_pos[:, 0] <= limit_max[0]) &
+        (all_atoms_pos[:, 1] >= limit_min[1]) & (all_atoms_pos[:, 1] <= limit_max[1]) &
+        (all_atoms_pos[:, 2] >= limit_min[2]) & (all_atoms_pos[:, 2] <= limit_max[2])
+    )
+
+    eff_pos = all_atoms_pos[inb]
+    eff_rmin2 = all_rmin2[inb]
+    eff_rmax2 = all_rmax2[inb]
+
+    bin_min = limit_min.astype(np.float64, copy=False)
+    bin_size = max(1e-6, global_max_r)
+
+    extent = (limit_max - limit_min)
+    bnx = max(1, int(np.ceil(extent[0] / bin_size)))
+    bny = max(1, int(np.ceil(extent[1] / bin_size)))
+    bnz = max(1, int(np.ceil(extent[2] / bin_size)))
+    nbins = bnx * bny * bnz
+
+    def clampi(v, lo, hi):
+        return lo if v < lo else (hi if v > hi else v)
+
+    def to_bin(p):
+        ix = int(np.floor((p[0] - bin_min[0]) / bin_size))
+        iy = int(np.floor((p[1] - bin_min[1]) / bin_size))
+        iz = int(np.floor((p[2] - bin_min[2]) / bin_size))
+        ix = clampi(ix, 0, bnx - 1)
+        iy = clampi(iy, 0, bny - 1)
+        iz = clampi(iz, 0, bnz - 1)
+        return ix + iy * bnx + iz * (bnx * bny)
+
+    offsets = np.zeros(nbins + 1, dtype=np.int32)
+    for p in eff_pos:
+        b = to_bin(p)
+        offsets[b + 1] += 1
+    np.cumsum(offsets, out=offsets)
+
+    indices = np.empty(len(eff_pos), dtype=np.int32)
+    cursor = offsets.copy()
+    for i, p in enumerate(eff_pos):
+        b = to_bin(p)
+        pos = cursor[b]
+        indices[pos] = i
+        cursor[b] += 1
+
+    eff_x = eff_pos[:, 0].astype(np.float64, copy=False)
+    eff_y = eff_pos[:, 1].astype(np.float64, copy=False)
+    eff_z = eff_pos[:, 2].astype(np.float64, copy=False)
+
+    return (eff_x, eff_y, eff_z, eff_rmin2, eff_rmax2,
+            bin_min, float(bin_size), int(bnx), int(bny), int(bnz),
+            offsets, indices)
+
+def _gpu_filter_mask_bins_cupy(nx, ny, nz, origin, ax0, ax1, ax2,
+                               bin_min, bin_size, bnx, bny, bnz,
+                               offsets, indices, eff_x, eff_y, eff_z, rmin2, rmax2,
+                               device_id=0):
+    import cupy as cp
+
+    kernel_src = r'''
+    extern "C" __global__
+    void filter_bins(
+        const int nx, const int ny, const int nz,
+        const double ox, const double oy, const double oz,
+        const double ax0x, const double ax0y, const double ax0z,
+        const double ax1x, const double ax1y, const double ax1z,
+        const double ax2x, const double ax2y, const double ax2z,
+        const double bminx, const double bminy, const double bminz,
+        const double bin_size,
+        const int bnx, const int bny, const int bnz,
+        const int* __restrict__ offsets,
+        const int* __restrict__ indices,
+        const double* __restrict__ ex,
+        const double* __restrict__ ey,
+        const double* __restrict__ ez,
+        const double* __restrict__ rmin2,
+        const double* __restrict__ rmax2,
+        unsigned char* __restrict__ keep
+    ) {
+        int tid = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+        int n_total = nx * ny * nz;
+        if (tid >= n_total) return;
+
+        int k = tid / (nx * ny);
+        int rem = tid - k * (nx * ny);
+        int j = rem / nx;
+        int i = rem - j * nx;
+
+        double gx = ox + ax0x * (double)i + ax1x * (double)j + ax2x * (double)k;
+        double gy = oy + ax0y * (double)i + ax1y * (double)j + ax2y * (double)k;
+        double gz = oz + ax0z * (double)i + ax1z * (double)j + ax2z * (double)k;
+
+        int bix = (int)floor((gx - bminx) / bin_size);
+        int biy = (int)floor((gy - bminy) / bin_size);
+        int biz = (int)floor((gz - bminz) / bin_size);
+
+        if (bix < 0) bix = 0; else if (bix >= bnx) bix = bnx - 1;
+        if (biy < 0) biy = 0; else if (biy >= bny) biy = bny - 1;
+        if (biz < 0) biz = 0; else if (biz >= bnz) biz = bnz - 1;
+
+        bool valid = true;
+        bool near = false;
+
+        for (int dz = -1; dz <= 1 && valid; dz++) {
+            int z2 = biz + dz;
+            if (z2 < 0 || z2 >= bnz) continue;
+            for (int dy = -1; dy <= 1 && valid; dy++) {
+                int y2 = biy + dy;
+                if (y2 < 0 || y2 >= bny) continue;
+                for (int dx = -1; dx <= 1 && valid; dx++) {
+                    int x2 = bix + dx;
+                    if (x2 < 0 || x2 >= bnx) continue;
+
+                    int b = x2 + y2 * bnx + z2 * (bnx * bny);
+                    int beg = offsets[b];
+                    int end = offsets[b + 1];
+
+                    for (int t = beg; t < end; t++) {
+                        int ai = indices[t];
+                        double dxp = gx - ex[ai];
+                        double dyp = gy - ey[ai];
+                        double dzp = gz - ez[ai];
+                        double d2 = dxp*dxp + dyp*dyp + dzp*dzp;
+                        if (d2 <= rmin2[ai]) { valid = false; break; }
+                        if (d2 <= rmax2[ai]) near = true;
+                    }
+                }
+            }
+        }
+
+        keep[tid] = (unsigned char)((valid && near) ? 1 : 0);
+    }
+    '''
+    with cp.cuda.Device(device_id):
+        filt = cp.RawKernel(kernel_src, "filter_bins")
+
+        n_total = int(nx * ny * nz)
+
+        d_offsets = cp.asarray(offsets, dtype=cp.int32)
+        d_indices = cp.asarray(indices, dtype=cp.int32)
+        d_ex = cp.asarray(eff_x, dtype=cp.float64)
+        d_ey = cp.asarray(eff_y, dtype=cp.float64)
+        d_ez = cp.asarray(eff_z, dtype=cp.float64)
+        d_rmin2 = cp.asarray(rmin2, dtype=cp.float64)
+        d_rmax2 = cp.asarray(rmax2, dtype=cp.float64)
+
+        keep = cp.empty((n_total,), dtype=cp.uint8)
+
+        threads = 256
+        blocks = (n_total + threads - 1) // threads
+
+        ox, oy, oz = (float(origin[0]), float(origin[1]), float(origin[2]))
+        ax0x, ax0y, ax0z = (float(ax0[0]), float(ax0[1]), float(ax0[2]))
+        ax1x, ax1y, ax1z = (float(ax1[0]), float(ax1[1]), float(ax1[2]))
+        ax2x, ax2y, ax2z = (float(ax2[0]), float(ax2[1]), float(ax2[2]))
+
+        bminx, bminy, bminz = (float(bin_min[0]), float(bin_min[1]), float(bin_min[2]))
+
+        filt((blocks,), (threads,), (
+            np.int32(nx), np.int32(ny), np.int32(nz),
+            np.float64(ox), np.float64(oy), np.float64(oz),
+            np.float64(ax0x), np.float64(ax0y), np.float64(ax0z),
+            np.float64(ax1x), np.float64(ax1y), np.float64(ax1z),
+            np.float64(ax2x), np.float64(ax2y), np.float64(ax2z),
+            np.float64(bminx), np.float64(bminy), np.float64(bminz),
+            np.float64(bin_size),
+            np.int32(bnx), np.int32(bny), np.int32(bnz),
+            d_offsets, d_indices,
+            d_ex, d_ey, d_ez,
+            d_rmin2, d_rmax2,
+            keep
+        ))
+
+        return keep
+
+# -------------------- Ewald Calculator --------------------
 class EwaldCalculator:
     """
     Ewald summation calculator.
@@ -722,6 +913,7 @@ class EwaldCalculator:
 
         self.alpha = (PI / self.R_cutoff) ** 2
         self.sqrt_alpha = float(np.sqrt(self.alpha))
+        self.self_term = float(2.0 * self.sqrt_alpha / np.sqrt(PI))
 
         self.block_k = int(block_k) if block_k is not None else 256
         self.use_jit = bool(use_jit and _JIT_OK)
@@ -743,12 +935,20 @@ class EwaldCalculator:
 
             self._setup_kspace()
             self.shifts = _make_realspace_shifts(self.nmax, self.box_vectors)
+            self.shifts_pruned = None
         else:
             self.recip_vectors = None
             self.nmax = np.array([0, 0, 0], dtype=np.int64)
             self.kvecs = np.empty((0, 3), dtype=np.float64)
             self.kcoefs = np.empty((0,), dtype=np.float64)
             self.shifts = np.zeros((1, 3), dtype=np.float64)
+            self.shifts_pruned = self.shifts
+
+        self.zero_shift_idx = -1
+        for idx, sh in enumerate(self.shifts):
+            if sh[0] == 0.0 and sh[1] == 0.0 and sh[2] == 0.0:
+                self.zero_shift_idx = idx
+                break
 
     def _setup_kspace(self):
         KMAX, KSQMAX = 7, 49
@@ -769,25 +969,43 @@ class EwaldCalculator:
         self.kvecs = np.asarray(kvecs, dtype=np.float64)
         self.kcoefs = np.asarray(kcoefs, dtype=np.float64)
 
+    def prepare_pruned_shifts(self, grid_pos, atom_positions):
+        """
+        Prune real-space shifts using AABB distance test. Call after grid_pos is known.
+        This reduces S dramatically and speeds up GPU/CPU real-space sums.
+        """
+        if self.fit_flag != 1:
+            self.shifts_pruned = self.shifts
+            return
+
+        pruned = _prune_realspace_shifts_aabb(
+            self.shifts,
+            grid_pos=np.asarray(grid_pos, dtype=np.float64),
+            box_vectors=self.box_vectors,
+            atom_positions=np.asarray(atom_positions, dtype=np.float64),
+            R_cutoff=self.R_cutoff,
+        )
+        self.shifts_pruned = pruned
+
+        self.zero_shift_idx = -1
+        for idx, sh in enumerate(self.shifts_pruned):
+            if sh[0] == 0.0 and sh[1] == 0.0 and sh[2] == 0.0:
+                self.zero_shift_idx = idx
+                break
+
     def compute_batch_parallel(self, grid_pos, atom_positions, n_cores=None, progress=True,
                                adaptive_block=True, min_block_k=8, max_retries=10):
         """
         Compute Ewald potential for a set of grid points and atoms.
         Returns a matrix of shape (n_grid, n_atoms).
-        
-        Automatically selects optimal parallel strategy based on system size:
-        - Large grids (>=10k): Numba parallel (prange) - no process overhead
-        - Medium grids: Multiprocessing with JIT
-        - Small grids (<1M work): Sequential JIT
         """
         n_atoms = len(atom_positions)
         n_grid = len(grid_pos)
-        
-        # Select parallel strategy
+
         strategy, n_workers, use_jit, n_gpus = select_parallel_strategy(
             n_grid, n_atoms, self.use_jit
         )
-        
+
         if progress:
             print(f"  Strategy: {strategy}, workers: {n_workers}, JIT: {use_jit}")
             if strategy == 'numba_parallel':
@@ -798,566 +1016,286 @@ class EwaldCalculator:
                     print(f"  Using {n_gpus} GPUs ({precision} precision)")
                 else:
                     print(f"  Using GPU {_GPU_CONFIG['devices'][0]} ({precision} precision)")
-        
-        # Execute with selected strategy
+
         if strategy == 'gpu':
-            return self._compute_gpu(
-                grid_pos, atom_positions, progress=progress
-            )
+            return self._compute_gpu(grid_pos, atom_positions, progress=progress)
         elif strategy == 'numba_parallel':
-            return self._compute_numba_parallel(
-                grid_pos, atom_positions, progress=progress
-            )
+            return self._compute_numba_parallel(grid_pos, atom_positions, progress=progress)
         elif strategy == 'nogil_threads':
-            # noGIL threading uses shared memory, similar to multiprocess but with threads
-            return self._compute_nogil_threads(
-                grid_pos, atom_positions, n_cores=n_workers, progress=progress
-            )
+            return self._compute_nogil_threads(grid_pos, atom_positions, n_cores=n_workers, progress=progress)
         elif strategy == 'multiprocess':
-            return self._compute_multiprocess(
-                grid_pos, atom_positions, n_cores=n_workers, progress=progress,
-                adaptive_block=adaptive_block, min_block_k=min_block_k, max_retries=max_retries
-            )
-        else:  # sequential
-            return self._compute_sequential(
-                grid_pos, atom_positions, use_jit=use_jit, progress=progress
-            )
-    
+            return self._compute_multiprocess(grid_pos, atom_positions, n_cores=n_workers, progress=progress,
+                                             adaptive_block=adaptive_block, min_block_k=min_block_k, max_retries=max_retries)
+        else:
+            return self._compute_sequential(grid_pos, atom_positions, use_jit=use_jit, progress=progress)
+
+    # -------------------- GPU compute (kept, minimal changes) --------------------
     def _compute_gpu(self, grid_pos, atom_positions, progress=True):
         """Compute using GPU acceleration with multi-GPU and mixed precision support."""
         import numpy as np
-        
+
         n_grid = len(grid_pos)
         n_atoms = len(atom_positions)
         devices = _GPU_CONFIG['devices']
         n_gpus = len(devices)
         use_fp32 = _GPU_CONFIG['use_mixed_precision']
-        
+
         dtype_str = "fp32" if use_fp32 else "fp64"
         if progress:
             if n_gpus > 1:
                 print(f"  Computing {n_atoms} atoms on {n_gpus} GPUs ({dtype_str})...")
             else:
                 print(f"  Computing {n_atoms} atoms on GPU {devices[0]} ({dtype_str})...")
-        
+
         if _GPU_INFO['cupy_available']:
             return self._compute_gpu_cupy(grid_pos, atom_positions, devices, use_fp32, progress)
         elif _GPU_INFO['torch_available']:
             return self._compute_gpu_torch(grid_pos, atom_positions, devices, use_fp32, progress)
         else:
             raise RuntimeError("GPU requested but no GPU backend available")
-    
+
     def _compute_gpu_cupy(self, grid_pos, atom_positions, devices, use_fp32, progress):
-        """Compute using CuPy with optimized CPU-GPU communication and memory management.
-        
-        Optimizations:
-        1. Batch transfer: Transfer all atoms at once instead of one by one
-        2. Pinned memory: Use pinned memory for faster transfers
-        3. Streams: Use CUDA streams for asynchronous operations
-        4. Pre-allocation: Pre-allocate GPU memory to avoid repeated allocation
-        5. Memory-aware batching: Automatically split computation to fit GPU memory
-        """
         import cupy as cp
         from cupyx.scipy.special import erfc as cupy_erfc
-        from concurrent.futures import ThreadPoolExecutor
-        import time
-        
+
         n_grid = len(grid_pos)
         n_atoms = len(atom_positions)
-        n_gpus = len(devices)
-        
-        # Choose dtype
-        cp_dtype = cp.float32 if use_fp32 else cp.float64
-        dtype_size = 4 if use_fp32 else 8
-        
-        if progress:
-            print(f"    GPU: Checking memory requirements...")
-        
-        # Calculate memory requirements
-        n_shifts = len(self.shifts)
-        n_k = len(self.kvecs)
-        
-        # Constants (transferred once, stay in GPU memory)
-        bytes_per_grid = n_grid * 3 * dtype_size
-        bytes_per_shifts = n_shifts * 3 * dtype_size
-        bytes_per_kvecs = n_k * 3 * dtype_size
-        bytes_per_kcoefs = n_k * dtype_size
-        constant_memory = bytes_per_grid + bytes_per_shifts + bytes_per_kvecs + bytes_per_kcoefs
-        
-        def estimate_batch_memory(n_batch):
-            """Estimate GPU memory needed for processing n_batch atoms simultaneously.
-            
-            For batch processing, peak memory includes:
-            - Real space intermediates: delta_real, r2_real, mask, erfc_term
-              Size: n_grid * n_batch * n_shifts * (3 + 1 + 1 + 1) * dtype_size
-            - Reciprocal space intermediates: delta_recp, kr, cos_kr  
-              Size: n_grid * n_batch * (3 + n_k + n_k) * dtype_size
-            - Result buffer: n_grid * n_batch * dtype_size
-            - Atoms buffer: n_batch * 3 * dtype_size
-            """
-            # Real space (4 arrays: delta components implicit in r2 calc)
-            real_space = n_grid * n_batch * n_shifts * 4 * dtype_size
-            
-            # Reciprocal space (3 arrays: delta, kr, cos_kr)
-            recp_space = n_grid * n_batch * (3 + 2 * n_k) * dtype_size
-            
-            # Output and input buffers
-            buffers = n_grid * n_batch * dtype_size + n_batch * 3 * dtype_size
-            
-            return real_space + recp_space + buffers
-        
-        def estimate_single_atom_memory():
-            """Estimate memory for current single-atom-at-a-time approach."""
-            # Current implementation uses these intermediates per atom:
-            # Real: delta_real [n_grid, n_shifts, 3], r2_real [n_grid, n_shifts], 
-            #       mask [n_grid, n_shifts], erfc_term [n_grid, n_shifts]
-            # Recp: delta_recp [n_grid, 3], kr [n_grid, n_k], cos_kr [n_grid, n_k]
-            real = n_grid * n_shifts * (3 + 1 + 1 + 1) * dtype_size
-            recp = n_grid * (3 + n_k + n_k) * dtype_size
-            return real + recp + n_grid * dtype_size  # Add result column
-        
-        # Check available GPU memory and determine batch size
-        def get_gpu_memory_info(device_id):
-            with cp.cuda.Device(device_id):
-                mem_info = cp.cuda.runtime.memGetInfo()
-                free_bytes = mem_info[0]
-                total_bytes = mem_info[1]
-                # Reserve 20% for overhead
-                usable_bytes = int(free_bytes * 0.8)
-                return usable_bytes, total_bytes
-        
-        # Calculate optimal batch size per GPU
-        gpu_memory_info = []
-        for device_id in devices:
-            usable, total = get_gpu_memory_info(device_id)
-            gpu_memory_info.append((device_id, usable, total))
-            
-        min_usable = min(info[1] for info in gpu_memory_info)
-        
-        # Memory needed for constants (grid_pos, shifts, kvecs, kcoefs)
-        constant_memory = bytes_per_grid + bytes_per_shifts + bytes_per_kvecs + bytes_per_kcoefs
-        
-        # Memory available for atom batches
-        available_for_atoms = min_usable - constant_memory
-        
-        # Calculate optimal batch size using binary search
-        # Find the largest batch size that fits in available memory
-        def find_optimal_batch_size():
-            """Find maximum batch size that fits in available memory."""
-            if available_for_atoms <= 0:
-                return 1  # Fallback to single atom
-            
-            # Binary search for optimal batch size
-            low, high = 1, max(1, n_atoms // n_gpus)
-            best_batch = 1
-            
-            while low <= high:
-                mid = (low + high) // 2
-                mem_needed = estimate_batch_memory(mid)
-                
-                if mem_needed <= available_for_atoms * 0.8:  # 80% safety margin
-                    best_batch = mid
-                    low = mid + 1
-                else:
-                    high = mid - 1
-            
-            return best_batch
-        
-        # Current single-atom memory usage
-        bytes_per_single_atom = estimate_single_atom_memory()
-        
-        if available_for_atoms < bytes_per_single_atom * 2:
-            # Fall back to CPU if GPU memory insufficient
-            print(f"    WARNING: GPU memory insufficient ({min_usable/1e9:.2f} GB available)")
-            print(f"    Falling back to sequential CPU computation...")
-            return self._compute_sequential(grid_pos, atom_positions, use_jit=True, progress=progress)
-        
-        # Calculate batch size based on memory availability
-        atoms_per_batch = find_optimal_batch_size()
-        
-        # Determine batch strategy for reporting
-        batch_memory = estimate_batch_memory(atoms_per_batch)
-        if atoms_per_batch >= n_atoms // n_gpus:
-            batch_strategy = "single-batch (memory sufficient)"
-        elif batch_memory >= available_for_atoms * 0.5:
-            batch_strategy = "large-batch"
-        else:
-            batch_strategy = f"batch-size-{atoms_per_batch} (memory limited)"
-        
-        if progress:
-            batch_mem_gb = estimate_batch_memory(atoms_per_batch) / 1e9
-            const_mem_gb = constant_memory / 1e9
-            avail_gb = available_for_atoms / 1e9
-            print(f"    GPU memory: {avail_gb:.2f} GB available (constants: {const_mem_gb:.2f} GB)")
-            print(f"    Batch size: {atoms_per_batch} atoms ({batch_mem_gb:.2f} GB per batch)")
-            print(f"    Strategy: {batch_strategy}")
-            print(f"    Estimated transfers: {max(1, (n_atoms // n_gpus + atoms_per_batch - 1) // atoms_per_batch)} per GPU")
-        
-        # Use pinned memory for faster CPU-GPU transfers
-        # Allocate pinned memory and create numpy array view
-        grid_pos_pinned = cp.cuda.alloc_pinned_memory(grid_pos.nbytes)
-        grid_pos_np = np.frombuffer(grid_pos_pinned, dtype=grid_pos.dtype, count=grid_pos.size).reshape(grid_pos.shape)
-        np.copyto(grid_pos_np, grid_pos)
-        
-        # Result buffer (pinned memory) - allocate in chunks
-        result_dtype = np.float32 if use_fp32 else np.float64
-        phi = np.zeros((n_grid, n_atoms), dtype=np.float64)  # Always return fp64
-        
-        # Setup GPU data structures
-        gpu_data = []
-        for device_id in devices:
-            with cp.cuda.Device(device_id):
-                stream = cp.cuda.Stream(non_blocking=True)
-                
-                # Allocate constants
-                # Convert to target dtype during transfer
-                grid_pos_gpu = cp.asarray(grid_pos_np, dtype=cp_dtype)
-                
-                kvecs_gpu = cp.asarray(self.kvecs, dtype=cp_dtype)
-                kcoefs_gpu = cp.asarray(self.kcoefs, dtype=cp_dtype)
-                shifts_gpu = cp.asarray(self.shifts, dtype=cp_dtype)
-                
-                # Pre-allocate working buffers (reused across batches)
-                max_batch_atoms = min(atoms_per_batch, n_atoms)
-                result_buffer = cp.empty((n_grid, max_batch_atoms), dtype=cp_dtype)
-                atoms_buffer = cp.empty((max_batch_atoms, 3), dtype=cp_dtype)
-                
-                gpu_data.append({
-                    'device_id': device_id,
-                    'stream': stream,
-                    'grid_pos': grid_pos_gpu,
-                    'kvecs': kvecs_gpu,
-                    'kcoefs': kcoefs_gpu,
-                    'shifts': shifts_gpu,
-                    'result_buffer': result_buffer,
-                    'atoms_buffer': atoms_buffer,
-                    'max_batch_atoms': max_batch_atoms,
-                })
-        
-        if progress:
-            print(f"    GPU: Computing...")
-            start_time = time.time()
-            last_update = start_time
-        
-        # Use a list to track progress (avoid nonlocal in nested function)
-        progress_tracker = [0]  # progress_tracker[0] = completed_atoms
-        
-        def compute_batch(gpu_idx, atom_start, atom_end):
-            """Compute a batch of atoms on a specific GPU with vectorized shifts and k-vectors."""
-            data = gpu_data[gpu_idx]
-            device_id = data['device_id']
-            stream = data['stream']
-            
-            n_batch_atoms = atom_end - atom_start
-            
-            with cp.cuda.Device(device_id):
-                # Transfer atom positions for this batch
-                atom_batch = atom_positions[atom_start:atom_end]
-                # Convert to target dtype during transfer to avoid type mismatch
-                atom_batch_cp = cp.asarray(atom_batch, dtype=cp_dtype)
-                data['atoms_buffer'][:n_batch_atoms] = atom_batch_cp
-                
-                # Pre-compute constants as Python floats (not CuPy scalars)
-                sqrt_alpha_val = float(self.sqrt_alpha)
-                R2_val = float(self.R_cutoff ** 2)
-                
-                # Find zero shift index for self-interaction exclusion
-                # Check on CPU to avoid GPU-CPU sync in loop
-                shifts_cpu = cp.asnumpy(data['shifts'])
-                zero_shift_idx = -1
-                for idx, shift in enumerate(shifts_cpu):
-                    if shift[0] == 0.0 and shift[1] == 0.0 and shift[2] == 0.0:
-                        zero_shift_idx = idx
-                        break
-                
-                # Compute all atoms in batch
-                for local_i in range(n_batch_atoms):
-                    atom_pos_gpu = data['atoms_buffer'][local_i]
-                    
-                    # === Real Space Contribution (Vectorized) ===
-                    # Compute distances to all image positions at once
-                    # [n_grid, 1, 3] - [1, n_shifts, 3] -> [n_grid, n_shifts, 3]
-                    img_positions = atom_pos_gpu + data['shifts']  # [n_shifts, 3]
-                    delta_real = data['grid_pos'][:, None, :] - img_positions[None, :, :]  # [n_grid, n_shifts, 3]
-                    r2_real = cp.sum(delta_real ** 2, axis=2)  # [n_grid, n_shifts]
-                    
-                    # Apply cutoff mask
-                    mask = r2_real <= R2_val
-                    
-                    # Exclude self-interaction for zero shift
-                    if zero_shift_idx >= 0:
-                        # Create a copy of mask and exclude r2 < 1e-20 for zero shift
-                        mask = mask.copy()
-                        mask[:, zero_shift_idx] = mask[:, zero_shift_idx] & (r2_real[:, zero_shift_idx] > 1e-20)
-                    
-                    # Compute erfc/r for all valid points (where mask is True)
-                    # Use cp.where to avoid computing sqrt for all points
-                    r_real = cp.sqrt(r2_real)
-                    # Safe division: where mask is False, result is 0
-                    erfc_term = cp.where(mask, cupy_erfc(sqrt_alpha_val * r_real) / r_real, 0.0)
-                    
-                    # Sum over all shifts
-                    phi_real = cp.sum(erfc_term, axis=1)  # [n_grid]
-                    
-                    # === Reciprocal Space Contribution (Vectorized) ===
-                    # delta: [n_grid, 3]
-                    delta_recp = data['grid_pos'] - atom_pos_gpu  # [n_grid, 3]
-                    
-                    # Compute k·r for all k-vectors using matrix multiplication
-                    # [n_grid, 3] @ [3, n_k] -> [n_grid, n_k]
-                    kr = delta_recp @ data['kvecs'].T
-                    cos_kr = cp.cos(kr)  # [n_grid, n_k]
-                    
-                    # Weighted sum over k-vectors
-                    # [n_grid, n_k] @ [n_k] -> [n_grid]
-                    phi_recp = cos_kr @ data['kcoefs']
-                    
-                    # Combine and store
-                    data['result_buffer'][:, local_i] = phi_real + phi_recp
-                
-                # Transfer results back
-                stream.synchronize()
-                result_gpu = data['result_buffer'][:, :n_batch_atoms]
-                result_slice = phi[:, atom_start:atom_end]
-                result_slice[:] = cp.asnumpy(result_gpu)
-                
-                return n_batch_atoms
-        
-        # Process all batches
-        if n_gpus > 1:
-            # Multi-GPU: distribute batches across GPUs
-            with ThreadPoolExecutor(max_workers=n_gpus) as executor:
-                futures = []
-                atom_idx = 0
-                
-                while atom_idx < n_atoms:
-                    for gpu_idx in range(n_gpus):
-                        if atom_idx >= n_atoms:
-                            break
-                        
-                        batch_start = atom_idx
-                        batch_end = min(batch_start + atoms_per_batch, n_atoms)
-                        
-                        future = executor.submit(compute_batch, gpu_idx, batch_start, batch_end)
-                        batch_size = batch_end - batch_start
-                        futures.append((future, batch_size))
-                        
-                        atom_idx = batch_end
-                    
-                    # Wait for current wave to complete
-                    for future, batch_size in futures:
-                        completed = future.result()
-                        progress_tracker[0] += completed
-                    futures = []
-                    
-                    # Progress update
-                    if progress:
-                        current_time = time.time()
-                        if current_time - last_update > 1.0:  # Update every second
-                            completed = progress_tracker[0]
-                            pct = 100 * completed / n_atoms
-                            elapsed = current_time - start_time
-                            rate = completed / elapsed if elapsed > 0 else 0
-                            print(f"    Progress: {completed}/{n_atoms} ({pct:.1f}%) [{elapsed:.1f}s, {rate:.1f} atoms/s]")
-                            last_update = current_time
-        else:
-            # Single GPU: process all batches sequentially
-            atom_idx = 0
-            while atom_idx < n_atoms:
-                batch_end = min(atom_idx + atoms_per_batch, n_atoms)
-                completed = compute_batch(0, atom_idx, batch_end)
-                progress_tracker[0] += completed
-                
-                if progress:
-                    current_time = time.time()
-                    if current_time - last_update > 1.0:
-                        completed = progress_tracker[0]
-                        pct = 100 * completed / n_atoms
-                        elapsed = current_time - start_time
-                        rate = completed / elapsed if elapsed > 0 else 0
-                        print(f"    Progress: {completed}/{n_atoms} ({pct:.1f}%) [{elapsed:.1f}s, {rate:.1f} atoms/s]")
-                        last_update = current_time
-                
-                atom_idx = batch_end
-        
-        if progress:
-            elapsed = time.time() - start_time
-            print(f"    Complete: {n_atoms}/{n_atoms} (100%) [{elapsed:.2f}s]")
-        
-        # Clean up GPU memory
-        for data in gpu_data:
-            device_id = data['device_id']
-            with cp.cuda.Device(device_id):
-                # Delete all GPU arrays
-                for key in ['grid_pos', 'kvecs', 'kcoefs', 'shifts', 'result_buffer', 'atoms_buffer']:
-                    if key in data:
-                        del data[key]
-                # Free memory pool
-                cp.get_default_memory_pool().free_all_blocks()
-                cp.get_default_pinned_memory_pool().free_all_blocks()
-        
-        # Clean up pinned memory
-        del grid_pos_pinned
-        
-        return phi
-    
+        if n_atoms == 0 or n_grid == 0:
+            return np.zeros((n_grid, n_atoms), dtype=np.float64)
+
+        shifts_cpu = self.shifts_pruned if (hasattr(self, "shifts_pruned") and self.shifts_pruned is not None) else self.shifts
+        shifts_cpu = np.asarray(shifts_cpu, dtype=np.float64)
+        S = shifts_cpu.shape[0]
+        zero_shift_idx = int(getattr(self, "zero_shift_idx", -1))
+
+        cp_work_dtype = cp.float32 if use_fp32 else cp.float64
+        trig_dtype = cp.float32
+        out_host = np.zeros((n_grid, n_atoms), dtype=np.float64)
+
+        sqrt_alpha_val = float(self.sqrt_alpha)
+        R2_val = float(self.R_cutoff * self.R_cutoff)
+
+        device_id = devices[0]
+        with cp.cuda.Device(device_id):
+            free_bytes, total_bytes = cp.cuda.runtime.memGetInfo()
+            usable = int(free_bytes * 0.35)
+
+            grid_gpu = cp.asarray(np.asarray(grid_pos, dtype=np.float64), dtype=cp_work_dtype)
+            atom_gpu = cp.asarray(np.asarray(atom_positions, dtype=np.float64), dtype=cp_work_dtype)
+            shifts_gpu = cp.asarray(shifts_cpu, dtype=cp_work_dtype)
+            kvecs_gpu = cp.asarray(self.kvecs, dtype=cp_work_dtype)
+            kcoefs_gpu = cp.asarray(self.kcoefs, dtype=cp_work_dtype)
+
+            M = int(grid_gpu.shape[0])
+            N = int(atom_gpu.shape[0])
+            K = int(kvecs_gpu.shape[0])
+
+            if progress:
+                print(f"    CuPy opt: M={M}, N={N}, K={K}, S={S}, fp32={use_fp32}, free={free_bytes/1e9:.2f}GB")
+
+            phi_gpu = cp.empty((M, N), dtype=cp_work_dtype)
+
+            if self.fit_flag == 0:
+                grid_norm = cp.sum(grid_gpu * grid_gpu, axis=1, keepdims=True)
+                atom_norm = cp.sum(atom_gpu * atom_gpu, axis=1, keepdims=True).T
+                dot = grid_gpu @ atom_gpu.T
+                r2 = cp.maximum(grid_norm + atom_norm - 2.0 * dot, 0.0)
+                phi_gpu[:] = cp.where(r2 > 1e-20, 1.0 / cp.sqrt(r2), 0.0)
+                out_host[:, :] = cp.asnumpy(phi_gpu).astype(np.float64, copy=False)
+                return out_host
+
+            kr_grid = grid_gpu @ kvecs_gpu.T
+            grid_c = cp.cos(kr_grid).astype(trig_dtype, copy=False)
+            grid_s = cp.sin(kr_grid).astype(trig_dtype, copy=False)
+
+            kr_atom = atom_gpu @ kvecs_gpu.T
+            atom_c = cp.cos(kr_atom).astype(trig_dtype, copy=False)
+            atom_s = cp.sin(kr_atom).astype(trig_dtype, copy=False)
+
+            w = kcoefs_gpu
+            Gc_w = grid_c.astype(cp_work_dtype, copy=False) * w[None, :]
+            Gs_w = grid_s.astype(cp_work_dtype, copy=False) * w[None, :]
+            Ac = atom_c.T.astype(cp_work_dtype, copy=False)
+            As = atom_s.T.astype(cp_work_dtype, copy=False)
+
+            phi_recp = Gc_w @ Ac
+            phi_recp += Gs_w @ As
+
+            grid_norm = cp.sum(grid_gpu * grid_gpu, axis=1, keepdims=True)
+            phi_real = cp.zeros((M, N), dtype=cp_work_dtype)
+
+            bytes_per = 4 if cp_work_dtype == cp.float32 else 8
+            denom = max(1, M * N * bytes_per)
+            Sb_max = max(1, int(usable / (3.5 * denom)))
+            shift_block = int(max(1, min(16, Sb_max, S)))
+
+            if progress:
+                print(f"    real-space shift_block={shift_block} (Sb_max={Sb_max})")
+
+            for s0 in range(0, S, shift_block):
+                s1 = min(s0 + shift_block, S)
+                Sb = s1 - s0
+                sh = shifts_gpu[s0:s1]
+
+                img = sh[:, None, :] + atom_gpu[None, :, :]
+                img2 = cp.sum(img * img, axis=2)
+                img_flat = img.reshape(Sb * N, 3)
+                dot = grid_gpu @ img_flat.T
+
+                r2 = cp.maximum(grid_norm + img2.reshape(1, Sb * N) - 2.0 * dot, 0.0)
+                msk = r2 <= R2_val
+
+                if zero_shift_idx >= 0 and s0 <= zero_shift_idx < s1:
+                    local = zero_shift_idx - s0
+                    lo = local * N
+                    hi = lo + N
+                    msk[:, lo:hi] &= (r2[:, lo:hi] > 1e-20)
+
+                r = cp.sqrt(r2)
+                term = cp.where(msk, cupy_erfc(sqrt_alpha_val * r) / r, 0.0)
+                phi_real += cp.sum(term.reshape(M, Sb, N), axis=1)
+
+                del img, img2, img_flat, dot, r2, msk, r, term
+
+            phi_gpu[:] = phi_real + phi_recp
+            out_host[:, :] = cp.asnumpy(phi_gpu).astype(np.float64, copy=False)
+            return out_host
+
     def _compute_gpu_torch(self, grid_pos, atom_positions, devices, use_fp32, progress):
-        """Compute using PyTorch with multi-GPU support."""
         import torch
-        from concurrent.futures import ThreadPoolExecutor
-        
+
         n_grid = len(grid_pos)
         n_atoms = len(atom_positions)
-        n_gpus = len(devices)
-        
-        # Choose dtype
-        torch_dtype = torch.float32 if use_fp32 else torch.float64
-        np_dtype = np.float32 if use_fp32 else np.float64
-        
-        # Transfer common data to all GPUs
-        grid_pos_gpu_list = []
-        kvecs_gpu_list = []
-        kcoefs_gpu_list = []
-        shifts_gpu_list = []
-        
-        for device_id in devices:
-            device = torch.device(f'cuda:{device_id}')
-            grid_pos_gpu_list.append(torch.tensor(grid_pos, dtype=torch_dtype, device=device))
-            kvecs_gpu_list.append(torch.tensor(self.kvecs, dtype=torch_dtype, device=device))
-            kcoefs_gpu_list.append(torch.tensor(self.kcoefs, dtype=torch_dtype, device=device))
-            shifts_gpu_list.append(torch.tensor(self.shifts, dtype=torch_dtype, device=device))
-        
-        # Result array
-        phi = np.zeros((n_grid, n_atoms), dtype=np_dtype)
-        
-        # Divide atoms among GPUs
-        atoms_per_gpu = (n_atoms + n_gpus - 1) // n_gpus
-        
-        def compute_atom_range(gpu_idx, atom_start, atom_end):
-            """Compute a range of atoms on a specific GPU."""
-            device_id = devices[gpu_idx]
-            device = torch.device(f'cuda:{device_id}')
-            
-            grid_pos_gpu = grid_pos_gpu_list[gpu_idx]
-            kvecs_gpu = kvecs_gpu_list[gpu_idx]
-            kcoefs_gpu = kcoefs_gpu_list[gpu_idx]
-            shifts_gpu = shifts_gpu_list[gpu_idx]
-            
-            sqrt_alpha_val = torch.tensor(self.sqrt_alpha, dtype=torch_dtype, device=device)
-            R2 = torch.tensor(self.R_cutoff ** 2, dtype=torch_dtype, device=device)
-            
-            local_phi = torch.zeros((n_grid, atom_end - atom_start), dtype=torch_dtype, device=device)
-            
-            for local_i, atom_idx in enumerate(range(atom_start, atom_end)):
-                atom_pos = atom_positions[atom_idx]
-                atom_pos_gpu = torch.tensor(atom_pos, dtype=torch_dtype, device=device)
-                
-                # Real space contribution
-                phi_real = torch.zeros(n_grid, dtype=torch_dtype, device=device)
-                
-                for s in range(shifts_gpu.shape[0]):
-                    shift = shifts_gpu[s]
-                    img_pos = atom_pos_gpu + shift
-                    delta = grid_pos_gpu - img_pos
-                    r2 = torch.sum(delta ** 2, dim=1)
-                    
-                    mask = r2 <= R2
-                    if s == 0:
-                        mask = mask & (r2 > 1e-20)
-                    
-                    if torch.any(mask):
-                        r = torch.sqrt(r2[mask])
-                        phi_real[mask] += torch.erfc(sqrt_alpha_val * r) / r
-                
-                # Reciprocal space contribution
-                delta = grid_pos_gpu - atom_pos_gpu
-                phi_recp = torch.zeros(n_grid, dtype=torch_dtype, device=device)
-                
-                for j in range(len(kvecs_gpu)):
-                    kvec = kvecs_gpu[j]
-                    kcoef = kcoefs_gpu[j]
-                    kr = torch.sum(delta * kvec, dim=1)
-                    phi_recp += kcoef * torch.cos(kr)
-                
-                local_phi[:, local_i] = phi_real + phi_recp
-            
-            return global_i, local_phi.cpu().numpy()
-        
-        # Parallel computation across GPUs
-        if n_gpus > 1:
-            with ThreadPoolExecutor(max_workers=n_gpus) as executor:
-                futures = []
-                for gpu_idx in range(n_gpus):
-                    atom_start = gpu_idx * atoms_per_gpu
-                    atom_end = min(atom_start + atoms_per_gpu, n_atoms)
-                    if atom_start < atom_end:
-                        futures.append(executor.submit(compute_atom_range, gpu_idx, atom_start, atom_end))
-                
-                # Collect results
-                for i, future in enumerate(futures):
-                    last_atom_idx, local_phi = future.result()
-                    atom_start = i * atoms_per_gpu
-                    atom_end = min(atom_start + atoms_per_gpu, n_atoms)
-                    phi[:, atom_start:atom_end] = local_phi
-                    
-                    if progress:
-                        pct = 100 * atom_end / n_atoms
-                        print(f"    GPU batch complete: {atom_end}/{n_atoms} ({pct:.0f}%)")
-        else:
-            # Single GPU
-            _, local_phi = compute_atom_range(0, 0, n_atoms)
-            phi = local_phi
-        
-        # Clean up GPU memory
-        if n_gpus > 1:
-            for gpu_idx in range(n_gpus):
-                device_id = devices[gpu_idx]
-                device = torch.device(f'cuda:{device_id}')
-                with torch.cuda.device(device):
-                    torch.cuda.empty_cache()
-        else:
-            torch.cuda.empty_cache()
-        
-        return phi.astype(np.float64)  # Return in fp64 for compatibility
-    
+        if n_atoms == 0 or n_grid == 0:
+            return np.zeros((n_grid, n_atoms), dtype=np.float64)
+
+        device_id = devices[0]
+        device = torch.device(f"cuda:{device_id}")
+
+        shifts_cpu = self.shifts_pruned if (hasattr(self, "shifts_pruned") and self.shifts_pruned is not None) else self.shifts
+        shifts_cpu = np.asarray(shifts_cpu, dtype=np.float64)
+        S = shifts_cpu.shape[0]
+        zero_shift_idx = int(getattr(self, "zero_shift_idx", -1))
+
+        torch_work_dtype = torch.float32 if use_fp32 else torch.float64
+        trig_dtype = torch.float32
+        sqrt_alpha_val = float(self.sqrt_alpha)
+        R2_val = float(self.R_cutoff * self.R_cutoff)
+
+        if progress:
+            print(f"    Torch opt: M={n_grid}, N={n_atoms}, K={len(self.kvecs)}, S={S}, fp32={use_fp32}")
+
+        with torch.no_grad():
+            grid = torch.tensor(np.asarray(grid_pos, dtype=np.float64), dtype=torch_work_dtype, device=device)
+            atom = torch.tensor(np.asarray(atom_positions, dtype=np.float64), dtype=torch_work_dtype, device=device)
+            shifts = torch.tensor(shifts_cpu, dtype=torch_work_dtype, device=device)
+            kvecs = torch.tensor(np.asarray(self.kvecs, dtype=np.float64), dtype=torch_work_dtype, device=device)
+            kcoefs = torch.tensor(np.asarray(self.kcoefs, dtype=np.float64), dtype=torch_work_dtype, device=device)
+
+            M = grid.shape[0]
+            N = atom.shape[0]
+
+            if self.fit_flag == 0:
+                grid_norm = (grid * grid).sum(dim=1, keepdim=True)
+                atom_norm = (atom * atom).sum(dim=1, keepdim=True).t()
+                dot = grid @ atom.t()
+                r2 = torch.clamp(grid_norm + atom_norm - 2.0 * dot, min=0.0)
+                phi = torch.where(r2 > 1e-20, 1.0 / torch.sqrt(r2), torch.zeros_like(r2))
+                return phi.double().cpu().numpy()
+
+            kr_grid = grid @ kvecs.t()
+            grid_c = torch.cos(kr_grid).to(dtype=trig_dtype)
+            grid_s = torch.sin(kr_grid).to(dtype=trig_dtype)
+
+            kr_atom = atom @ kvecs.t()
+            atom_c = torch.cos(kr_atom).to(dtype=trig_dtype)
+            atom_s = torch.sin(kr_atom).to(dtype=trig_dtype)
+
+            w = kcoefs
+            Gc_w = grid_c.to(dtype=torch_work_dtype) * w.unsqueeze(0)
+            Gs_w = grid_s.to(dtype=torch_work_dtype) * w.unsqueeze(0)
+            Ac = atom_c.t().to(dtype=torch_work_dtype)
+            As = atom_s.t().to(dtype=torch_work_dtype)
+
+            phi_recp = Gc_w @ Ac
+            phi_recp = phi_recp + (Gs_w @ As)
+
+            grid_norm = (grid * grid).sum(dim=1, keepdim=True)
+            phi_real = torch.zeros((M, N), dtype=torch_work_dtype, device=device)
+
+            shift_block = 4 if S > 4 else S
+
+            erfc_fn = getattr(torch, "erfc", None)
+            if erfc_fn is None:
+                erfc_fn = getattr(getattr(torch, "special", None), "erfc", None)
+            if erfc_fn is None:
+                raise RuntimeError("PyTorch erfc not available; please upgrade torch or use CuPy backend.")
+
+            for s0 in range(0, S, shift_block):
+                s1 = min(s0 + shift_block, S)
+                Sb = s1 - s0
+                sh = shifts[s0:s1]
+
+                img = sh[:, None, :] + atom[None, :, :]
+                img2 = (img * img).sum(dim=2)
+                img_flat = img.reshape(Sb * N, 3)
+                dot = grid @ img_flat.t()
+
+                r2 = torch.clamp(grid_norm + img2.reshape(1, Sb * N) - 2.0 * dot, min=0.0)
+                msk = r2 <= R2_val
+
+                if zero_shift_idx >= 0 and s0 <= zero_shift_idx < s1:
+                    local = zero_shift_idx - s0
+                    lo = local * N
+                    hi = lo + N
+                    msk[:, lo:hi] = msk[:, lo:hi] & (r2[:, lo:hi] > 1e-20)
+
+                r = torch.sqrt(r2)
+                term = torch.zeros_like(r)
+                term[msk] = erfc_fn(r[msk] * sqrt_alpha_val) / r[msk]
+                phi_real = phi_real + term.reshape(M, Sb, N).sum(dim=1)
+
+            phi = phi_real + phi_recp
+            return phi.double().cpu().numpy()
+
+    # -------------------- CPU compute paths --------------------
     def _compute_nogil_threads(self, grid_pos, atom_positions, n_cores=None, progress=True):
         """Compute using noGIL threading - shared memory, no serialization overhead."""
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        from functools import partial
-        
         n_grid = len(grid_pos)
         n_atoms = len(atom_positions)
-        
+
         if n_cores is None:
             n_cores = _get_optimal_workers()
-        
+
+        _maybe_limit_blas_threads(enable=True)
+
         phi = np.zeros((n_grid, n_atoms), dtype=np.float64)
         grid_pos_arr = np.asarray(grid_pos, dtype=np.float64)
         atom_positions_arr = np.asarray(atom_positions, dtype=np.float64)
-        
+
+        shifts = self.shifts_pruned if self.shifts_pruned is not None else self.shifts
+
         if progress:
             print(f"  Computing with noGIL threads ({n_cores} workers)...")
-        
-        # Prepare worker function with bound arguments
+
         worker_func = partial(
             _compute_ewald_atom_worker,
             grid_pos=grid_pos_arr,
             kvecs=self.kvecs,
             kcoefs=self.kcoefs,
-            shifts=self.shifts,
+            shifts=shifts,
             R_cutoff=self.R_cutoff,
             sqrt_alpha=self.sqrt_alpha,
             fit_flag=self.fit_flag,
             block_k=self.block_k,
             use_jit=self.use_jit,
         )
-        
-        # Create job list
+
         jobs = [(idx, atom_positions_arr[idx]) for idx in range(n_atoms)]
-        
+
         with ThreadPoolExecutor(max_workers=n_cores) as executor:
             futures = {executor.submit(worker_func, idx, pos): idx for idx, pos in jobs}
-            
+
             done_count = 0
             for future in as_completed(futures):
                 atom_idx, col = future.result()
@@ -1366,209 +1304,153 @@ class EwaldCalculator:
                 if progress and done_count % max(1, n_atoms // 10) == 0:
                     pct = 100 * done_count / n_atoms
                     print(f"    Progress: {done_count}/{n_atoms} ({pct:.0f}%)", flush=True)
-        
+
         return phi
-    
+
     def _compute_numba_parallel(self, grid_pos, atom_positions, progress=True):
         """Compute using Numba parallel (prange) - best for large grids."""
         n_grid = len(grid_pos)
         n_atoms = len(atom_positions)
-        
+
         phi = np.zeros((n_grid, n_atoms), dtype=np.float64)
         grid_pos_arr = np.asarray(grid_pos, dtype=np.float64)
-        
+        atom_positions_arr = np.asarray(atom_positions, dtype=np.float64)
+
+        shifts = self.shifts_pruned if self.shifts_pruned is not None else self.shifts
+
         if progress:
             print(f"  Computing {n_atoms} atoms with Numba parallel...")
-        
-        for i, atom_pos in enumerate(atom_positions):
+
+        for i in range(n_atoms):
+            atom_pos = atom_positions_arr[i]
             delta = grid_pos_arr - atom_pos
-            
-            # Use parallel JIT functions
-            phi_recp = _reciprocal_sum_blocked_jit_parallel(
-                delta, self.kvecs, self.kcoefs, self.block_k
-            )
-            phi_real = _real_space_sum_jit_parallel(
-                grid_pos_arr, atom_pos, self.shifts, 
-                self.R_cutoff, self.sqrt_alpha
-            )
-            
-            phi[:, i] = phi_recp + phi_real
-            
+
+            if self.fit_flag == 0:
+                dists = np.linalg.norm(delta, axis=1)
+                phi[:, i] = np.where(dists > 1e-10, 1.0 / dists, 0.0)
+            else:
+                phi_recp = _reciprocal_sum_blocked_jit_parallel(delta, self.kvecs, self.kcoefs, self.block_k)
+                phi_real = _real_space_sum_jit_parallel(grid_pos_arr, atom_pos, shifts, self.R_cutoff, self.sqrt_alpha)
+                phi[:, i] = phi_recp + phi_real
+
             if progress and (i + 1) % max(1, n_atoms // 10) == 0:
                 pct = 100 * (i + 1) / n_atoms
                 print(f"    Progress: {i+1}/{n_atoms} ({pct:.0f}%)")
-        
+
         return phi
-    
+
     def _compute_sequential(self, grid_pos, atom_positions, use_jit=True, progress=True):
         """Compute sequentially - best for small systems."""
         n_grid = len(grid_pos)
         n_atoms = len(atom_positions)
-        
+
         phi = np.zeros((n_grid, n_atoms), dtype=np.float64)
         grid_pos_arr = np.asarray(grid_pos, dtype=np.float64)
         atom_positions_arr = np.asarray(atom_positions, dtype=np.float64)
-        
+
+        shifts = self.shifts_pruned if self.shifts_pruned is not None else self.shifts
+
         if progress:
             print(f"  Computing {n_atoms} atoms sequentially...")
-        
+
         for i in range(n_atoms):
             atom_pos = atom_positions_arr[i]
             delta = grid_pos_arr - atom_pos
-            
+
+            if self.fit_flag == 0:
+                dists = np.linalg.norm(delta, axis=1)
+                phi[:, i] = np.where(dists > 1e-10, 1.0 / dists, 0.0)
+                continue
+
             if use_jit and _JIT_OK:
-                phi_recp = _reciprocal_sum_blocked_jit(
-                    delta, self.kvecs, self.kcoefs, self.block_k
-                )
-                phi_real = _real_space_sum_jit(
-                    grid_pos_arr, atom_pos, self.shifts,
-                    self.R_cutoff, self.sqrt_alpha
-                )
+                phi_recp = _reciprocal_sum_blocked_jit(delta, self.kvecs, self.kcoefs, self.block_k)
+                phi_real = _real_space_sum_jit(grid_pos_arr, atom_pos, shifts, self.R_cutoff, self.sqrt_alpha)
             else:
-                phi_recp = _reciprocal_sum_blocked(
-                    delta, self.kvecs, self.kcoefs, self.block_k, use_jit=False
-                )
-                phi_real = _real_space_sum(
-                    grid_pos_arr, atom_pos, self.shifts,
-                    self.R_cutoff, self.sqrt_alpha, use_jit=False
-                )
-            
+                phi_recp = _reciprocal_sum_blocked(delta, self.kvecs, self.kcoefs, self.block_k, use_jit=False)
+                phi_real = _real_space_sum(grid_pos_arr, atom_pos, shifts, self.R_cutoff, self.sqrt_alpha, use_jit=False)
+
             phi[:, i] = phi_recp + phi_real
-            
+
             if progress and (i + 1) % max(1, n_atoms // 10) == 0:
                 pct = 100 * (i + 1) / n_atoms
                 print(f"    Progress: {i+1}/{n_atoms} ({pct:.0f}%)")
-        
+
         return phi
-    
+
     def _compute_multiprocess(self, grid_pos, atom_positions, n_cores=None, progress=True,
-                              adaptive_block=True, min_block_k=8, max_retries=10):
+                             adaptive_block=True, min_block_k=8, max_retries=10):
         """Compute using multiprocessing - best for medium systems."""
-        use_threads = _NOGIL_ENABLED
-        
-        # Check memory
+        use_threads, mp_ctx = _pick_parallel_backend(prefer_threads=False)
+
         if psutil is not None:
             available_ram = psutil.virtual_memory().available
         else:
             available_ram = 4 * 1024 * 1024 * 1024
-        
+
         n_atoms = len(atom_positions)
         n_grid = len(grid_pos)
-        
+
         phi_bytes = n_grid * n_atoms * 8
         if phi_bytes > available_ram * 0.9:
-            raise MemoryError(
-                f"Not enough RAM for result matrix. Need {phi_bytes/1e9:.2f} GB"
-            )
-        
+            raise MemoryError(f"Not enough RAM for result matrix. Need {phi_bytes/1e9:.2f} GB")
+
         remaining_ram = available_ram - phi_bytes
-        worker_base_overhead = 256 * 1024 * 1024 if use_threads else 512 * 1024 * 1024
-        
+        worker_base_overhead = 512 * 1024 * 1024
+
         block_k = int(self.block_k)
         last_exc = None
-        
+
+        shifts = self.shifts_pruned if self.shifts_pruned is not None else self.shifts
+
         for _attempt in range(max_retries if adaptive_block else 1):
             try:
-                # Determine batch size
                 temp_bytes_per_atom = n_grid * block_k * 8
                 safe_worker_ram = remaining_ram * 0.8
                 estimated_mem_per_worker = worker_base_overhead + temp_bytes_per_atom
                 max_workers_by_mem = int(safe_worker_ram // max(1, estimated_mem_per_worker))
                 effective_cores = min(n_cores, max(1, max_workers_by_mem))
-                
-                # Batch sizing
-                MIN_BATCH_SIZE = 1
-                if effective_cores > 1:
-                    max_batch_size = max(MIN_BATCH_SIZE, n_atoms // effective_cores)
-                    target_batches = effective_cores * (2 if use_threads else 3)
-                    batch_size_from_target = max(MIN_BATCH_SIZE, n_atoms // max(1, target_batches))
-                    batch_size = min(max_batch_size, batch_size_from_target)
-                    
-                    max_chunk_bytes = 1024 * 1024 * 1024 if use_threads else 512 * 1024 * 1024
-                    bytes_per_atom_res = n_grid * 8
-                    max_batch_by_ipc = max(MIN_BATCH_SIZE, int(max_chunk_bytes // max(1, bytes_per_atom_res)))
-                    batch_size = min(batch_size, max_batch_by_ipc)
-                    batch_size = min(batch_size, n_atoms)
-                else:
-                    batch_size = max(MIN_BATCH_SIZE, n_atoms)
-                
-                # Prepare data
+
                 grid_pos_arr = np.asarray(grid_pos, dtype=np.float64)
                 atom_positions_arr = np.asarray(atom_positions, dtype=np.float64)
-                
                 phi = np.zeros((n_grid, n_atoms), dtype=np.float64)
-                
-                jobs = [(idx, atom_positions_arr[idx]) for idx in range(n_atoms)]
-                total_jobs = len(jobs)
-                
-                if effective_cores <= 1 or total_jobs <= 1:
-                    # Fall back to sequential
+
+                if effective_cores <= 1 or n_atoms <= 1:
                     return self._compute_sequential(grid_pos, atom_positions, use_jit=True, progress=progress)
-                
-                # Execute with appropriate backend
-                if use_threads and _NOGIL_ENABLED:
-                    worker_func = partial(
-                        _compute_ewald_atom_worker,
-                        grid_pos=grid_pos_arr,
-                        kvecs=self.kvecs,
-                        kcoefs=self.kcoefs,
-                        shifts=self.shifts,
-                        R_cutoff=self.R_cutoff,
-                        sqrt_alpha=self.sqrt_alpha,
-                        fit_flag=self.fit_flag,
-                        block_k=block_k,
-                        use_jit=self.use_jit,
-                    )
-                    
-                    with ThreadPoolExecutor(max_workers=effective_cores) as executor:
-                        futures = {executor.submit(worker_func, idx, pos): idx for idx, pos in jobs}
-                        
-                        done_count = 0
-                        for future in as_completed(futures):
-                            atom_idx, col = future.result()
-                            phi[:, atom_idx] = col
-                            done_count += 1
-                            if progress and done_count % max(1, total_jobs // 10) == 0:
-                                pct = 100 * done_count / total_jobs
-                                print(f"    Batch Progress: {done_count}/{total_jobs} ({pct:.0f}%)", flush=True)
-                else:
-                    # Process-based
-                    mp_ctx = _pick_parallel_backend(prefer_threads=False)[2]
-                    
-                    batch_jobs = []
-                    for start in range(0, n_atoms, batch_size):
-                        end = min(start + batch_size, n_atoms)
-                        batch_jobs.append((start, jobs[start:end]))
-                    
-                    total_batches = len(batch_jobs)
-                    if total_batches <= effective_cores:
-                        chunksize = 1
-                    else:
-                        chunksize = max(1, total_batches // effective_cores // 2)
-                    
-                    if progress:
-                        print(f"    Parallel config: {effective_cores} processes, {total_batches} batches, chunksize={chunksize}")
-                    
-                    with mp_ctx.Pool(processes=effective_cores) as pool:
-                        it = pool.imap_unordered(
-                            _compute_ewald_batch_wrapper,
-                            [(*batch, grid_pos_arr, self.kvecs, self.kcoefs, self.shifts,
-                              self.R_cutoff, self.sqrt_alpha, self.fit_flag, block_k, self.use_jit)
-                             for batch in batch_jobs],
-                            chunksize=chunksize
-                        )
-                        
-                        done_count = 0
-                        for batch_result in it:
-                            for atom_idx, col in batch_result:
-                                phi[:, atom_idx] = col
-                            done_count += 1
-                            if progress and done_count % max(1, total_batches // 10) == 0:
-                                pct = 100 * done_count / total_batches
-                                print(f"    Batch Progress: {done_count}/{total_batches} ({pct:.0f}%)", flush=True)
-                
+
+                if progress:
+                    print(f"    Parallel config: {effective_cores} processes (initializer cache), block_k={block_k}")
+
+                _maybe_limit_blas_threads(enable=True)
+
+                shared = {
+                    "grid_pos": grid_pos_arr,
+                    "kvecs": self.kvecs,
+                    "kcoefs": self.kcoefs,
+                    "shifts": shifts,
+                    "R_cutoff": self.R_cutoff,
+                    "sqrt_alpha": self.sqrt_alpha,
+                    "fit_flag": self.fit_flag,
+                    "block_k": block_k,
+                    "use_jit": self.use_jit,
+                }
+
+                with ProcessPoolExecutor(max_workers=effective_cores, mp_context=mp_ctx,
+                                         initializer=_mp_init_worker, initargs=(shared,)) as ex:
+                    futures = {}
+                    for idx in range(n_atoms):
+                        futures[ex.submit(_mp_compute_atom, (idx, atom_positions_arr[idx]))] = idx
+
+                    done_count = 0
+                    for fut in as_completed(futures):
+                        atom_idx, col = fut.result()
+                        phi[:, atom_idx] = col
+                        done_count += 1
+                        if progress and done_count % max(1, n_atoms // 10) == 0:
+                            pct = 100 * done_count / n_atoms
+                            print(f"    Batch Progress: {done_count}/{n_atoms} ({pct:.0f}%)", flush=True)
+
                 return phi
-                
+
             except MemoryError as e:
                 last_exc = e
                 if not adaptive_block or block_k <= min_block_k:
@@ -1577,7 +1459,7 @@ class EwaldCalculator:
                 if progress:
                     print(f"MemoryError: reducing block_k {block_k} -> {new_block} and retry ...")
                 block_k = new_block
-                
+
             except Exception as e:
                 last_exc = e
                 if self.use_jit:
@@ -1585,12 +1467,12 @@ class EwaldCalculator:
                         print(f"Warning: execution failed ({e}); disabling JIT and retry ...")
                     self.use_jit = False
                     continue
-                
-                # Fallback to sequential
+
                 return self._compute_sequential(grid_pos, atom_positions, use_jit=False, progress=progress)
-        
+
         raise last_exc if last_exc else RuntimeError("Unknown error in compute_batch_parallel")
 
+# -------------------- ChargeCalculator and rest (mostly unchanged) --------------------
 class ChargeCalculator:
     """Main calculator with streaming support for large systems."""
 
@@ -1629,19 +1511,26 @@ class ChargeCalculator:
         )
 
         self._neighbor_shifts_27 = _make_neighbor_shifts_27(self.box_vectors)
-        
+
         t0 = time.time()
         self.grid_pos, self.V_pot = self._filter_grid()
         print(f"  vdW filter completed in {time.time() - t0:.2f} seconds")
+
+        if self.fit_flag == 1:
+            t1 = time.time()
+            self.ewald.prepare_pruned_shifts(self.grid_pos, self.cube["atom_pos"])
+            if self.ewald.shifts_pruned is not None:
+                print(f"  Pruned shifts: {len(self.ewald.shifts)} -> {len(self.ewald.shifts_pruned)} in {time.time()-t1:.2f}s")
 
         self.symm_data = self._read_symmetry(symm_file) if symm_file else None
         self.resp_data = self._read_resp_params(resp_file) if resp_file else None
         self.qeq_data = self._read_qeq_params(qeq_file) if qeq_file else None
 
-        # Removed self._phi to enforce streaming logic
-        
-    # -------------------- IO (Unchanged) --------------------
+        self._phi_matrix = None
+        self._sum_phi = None
+        self._sum_V = None
 
+    # -------------------- IO (Unchanged) --------------------
     def _read_cube(self, filename):
         with open(filename, 'r') as f:
             f.readline()
@@ -1684,14 +1573,7 @@ class ChargeCalculator:
         }
 
     def _parse_atom_ranges(self, range_str):
-        """Parse atom range string like '1-5,9,10,15-18' to list of indices.
-        
-        Args:
-            range_str: String with atom indices/ranges (1-based, comma-separated)
-            
-        Returns:
-            List of 0-based atom indices
-        """
+        """Parse atom range string like '1-5,9,10,15-18' to list of indices."""
         indices = []
         for part in range_str.split(','):
             part = part.strip()
@@ -1703,7 +1585,6 @@ class ChargeCalculator:
                 indices.extend(range(start, end + 1))
             else:
                 indices.append(int(part))
-        # Convert to 0-based and remove duplicates while preserving order
         seen = set()
         result = []
         for idx in indices:
@@ -1712,48 +1593,36 @@ class ChargeCalculator:
                 seen.add(idx_0based)
                 result.append(idx_0based)
         return result
-    
+
     def _read_symmetry(self, filename):
-        """Read symmetry constraints from file.
-        
-        Format (NEW - simplified):
-            # Comments start with #
-            1-5,9,10        # Equivalent atoms group 1
-            15-18           # Equivalent atoms group 2
-            20,21,22        # Equivalent atoms group 3
-            
-        Each line defines one group of equivalent atoms.
-        Supports ranges (1-5), single indices (9), comma-separated lists.
-        First atom in each group is the base, others are linked.
-        """
+        """Read symmetry constraints from file."""
         try:
             with open(filename, 'r') as f:
                 lines = [line.strip() for line in f if line.strip() and not line.startswith('#')]
-            
+
             trees = []
             for line_num, line in enumerate(lines, 1):
-                # Remove inline comments
                 if '#' in line:
                     line = line.split('#')[0].strip()
                 if not line:
                     continue
-                    
+
                 atom_indices = self._parse_atom_ranges(line)
                 if len(atom_indices) < 1:
                     print(f"Warning: Line {line_num} has no valid atoms, skipping")
                     continue
-                    
+
                 trees.append({
                     'n_equiv': len(atom_indices),
                     'base': atom_indices[0],
                     'linked': atom_indices[1:] if len(atom_indices) > 1 else []
                 })
-            
+
             n_trees = len(trees)
             if n_trees > 0:
                 print(f"  Symmetry constraints loaded: {n_trees} groups")
                 for i, tree in enumerate(trees):
-                    base_idx = tree['base'] + 1  # Convert back to 1-based for display
+                    base_idx = tree['base'] + 1
                     linked_str = ','.join(str(x + 1) for x in tree['linked']) if tree['linked'] else 'none'
                     print(f"    Group {i+1}: base={base_idx}, linked=[{linked_str}]")
             return {'trees': trees, 'n_independent': n_trees}
@@ -1790,501 +1659,183 @@ class ChargeCalculator:
             return {}
 
     # -------------------- Grid Filtering --------------------
-
-    def _filter_grid_gpu_single(self, eff_atoms_pos, eff_radii_min, eff_radii_max,
-                                   base_xy, axis, nz, nx, ny, device_id=0):
-        """
-        Single GPU grid filtering using specified device with pinned memory optimization.
-        
-        Args:
-            device_id: GPU device ID to use
-        """
-        import cupy as cp
-        
-        # Set the device for this operation
-        with cp.cuda.Device(device_id):
-            n_atoms = len(eff_atoms_pos)
-            n_xy = nx * ny
-            n_total = n_xy * nz
-            
-            # Check memory on THIS device
-            free_mem = cp.cuda.Device(device_id).mem_info[0]
-            bytes_per_point = 24 + 8 * n_atoms * 2
-            bytes_needed = n_total * bytes_per_point
-            
-            # Use pinned memory for faster CPU->GPU transfers
-            # Allocate pinned memory and copy data
-            atoms_pos_pinned = cp.cuda.alloc_pinned_memory(eff_atoms_pos.nbytes)
-            atoms_pos_np = np.frombuffer(atoms_pos_pinned, dtype=eff_atoms_pos.dtype, 
-                                         count=eff_atoms_pos.size).reshape(eff_atoms_pos.shape)
-            np.copyto(atoms_pos_np, eff_atoms_pos)
-            
-            radii_min_pinned = cp.cuda.alloc_pinned_memory(eff_radii_min.nbytes)
-            radii_min_np = np.frombuffer(radii_min_pinned, dtype=eff_radii_min.dtype,
-                                         count=eff_radii_min.size)
-            np.copyto(radii_min_np, eff_radii_min)
-            
-            radii_max_pinned = cp.cuda.alloc_pinned_memory(eff_radii_max.nbytes)
-            radii_max_np = np.frombuffer(radii_max_pinned, dtype=eff_radii_max.dtype,
-                                         count=eff_radii_max.size)
-            np.copyto(radii_max_np, eff_radii_max)
-            
-            base_xy_pinned = cp.cuda.alloc_pinned_memory(base_xy.nbytes)
-            base_xy_np = np.frombuffer(base_xy_pinned, dtype=base_xy.dtype,
-                                       count=base_xy.size).reshape(base_xy.shape)
-            np.copyto(base_xy_np, base_xy)
-            
-            z_vec_pinned = cp.cuda.alloc_pinned_memory(axis[2].nbytes)
-            z_vec_np = np.frombuffer(z_vec_pinned, dtype=axis[2].dtype,
-                                     count=axis[2].size)
-            np.copyto(z_vec_np, axis[2])
-            
-            # Transfer data to GPU from pinned memory
-            atoms_pos_gpu = cp.asarray(atoms_pos_np, dtype=cp.float64)
-            radii_min_gpu = cp.asarray(radii_min_np, dtype=cp.float64)
-            radii_max_gpu = cp.asarray(radii_max_np, dtype=cp.float64)
-            base_xy_gpu = cp.asarray(base_xy_np, dtype=cp.float64)
-            z_vec = cp.asarray(z_vec_np, dtype=cp.float64)
-            
-            # Pre-compute atoms_norm
-            atoms_norm = cp.sum(atoms_pos_gpu ** 2, axis=1)
-            
-            # Use 40% of memory for single-pass processing
-            if bytes_needed <= free_mem * 0.4:
-                # Single-pass processing
-                z_range = cp.arange(nz, dtype=cp.float64)
-                z_grid = z_range[:, None] * z_vec[None, :]
-                grid_pos = base_xy_gpu[None, :, :] + z_grid[:, None, :]
-                grid_pos = grid_pos.reshape(-1, 3)
-                
-                grid_norm = cp.sum(grid_pos ** 2, axis=1, keepdims=True)
-                dot_product = grid_pos @ atoms_pos_gpu.T
-                dists_sq = grid_norm + atoms_norm - 2 * dot_product
-                dists = cp.sqrt(cp.maximum(dists_sq, 0))
-                
-                valid_mask = cp.all(dists > radii_min_gpu[None, :], axis=1)
-                near_mask = cp.any(dists <= radii_max_gpu[None, :], axis=1)
-                
-                valid_mask_cpu = valid_mask.get()
-                near_mask_cpu = near_mask.get()
-                
-                # Clean up GPU memory before returning
-                del (grid_pos, grid_norm, dot_product, dists_sq, dists, 
-                     valid_mask, near_mask, z_range, z_grid)
-                del atoms_pos_gpu, radii_min_gpu, radii_max_gpu
-                del base_xy_gpu, z_vec, atoms_norm
-                cp.get_default_memory_pool().free_all_blocks()
-                
-                # Clean up pinned memory
-                del atoms_pos_pinned, radii_min_pinned, radii_max_pinned
-                del base_xy_pinned, z_vec_pinned
-                
-                return valid_mask_cpu, near_mask_cpu, True
-            else:
-                # Need chunked processing on this device
-                chunk_z = max(1, int((free_mem * 0.5 / bytes_per_point) / n_xy))
-                chunk_z = min(chunk_z, nz)
-                
-                valid_mask_all = np.empty(n_total, dtype=bool)
-                near_mask_all = np.empty(n_total, dtype=bool)
-                
-                for z_start in range(0, nz, chunk_z):
-                    z_end = min(z_start + chunk_z, nz)
-                    
-                    z_range = cp.arange(z_start, z_end, dtype=cp.float64)
-                    z_grid = z_range[:, None] * z_vec[None, :]
-                    grid_pos = base_xy_gpu[None, :, :] + z_grid[:, None, :]
-                    grid_pos = grid_pos.reshape(-1, 3)
-                    
-                    grid_norm = cp.sum(grid_pos ** 2, axis=1, keepdims=True)
-                    dot_product = grid_pos @ atoms_pos_gpu.T
-                    dists_sq = grid_norm + atoms_norm - 2 * dot_product
-                    dists = cp.sqrt(cp.maximum(dists_sq, 0))
-                    
-                    valid_mask = cp.all(dists > radii_min_gpu[None, :], axis=1)
-                    near_mask = cp.any(dists <= radii_max_gpu[None, :], axis=1)
-                    
-                    start_idx = z_start * n_xy
-                    end_idx = z_end * n_xy
-                    valid_mask_all[start_idx:end_idx] = valid_mask.get()
-                    near_mask_all[start_idx:end_idx] = near_mask.get()
-                    
-                    del grid_pos, grid_norm, dot_product, dists_sq, dists, valid_mask, near_mask
-                
-                # Clean up GPU memory before returning
-                del atoms_pos_gpu, radii_min_gpu, radii_max_gpu
-                del base_xy_gpu, z_vec, atoms_norm
-                cp.get_default_memory_pool().free_all_blocks()
-                
-                # Clean up pinned memory
-                del atoms_pos_pinned, radii_min_pinned, radii_max_pinned
-                del base_xy_pinned, z_vec_pinned
-                
-                return valid_mask_all, near_mask_all, False
-
-    @staticmethod
-    def _cleanup_gpu_memory(device_ids=None):
-        """Clean up GPU memory after grid filtering.
-        
-        Args:
-            device_ids: List of device IDs to clean up, or None for all used devices
-        """
-        try:
-            import cupy as cp
-            import gc
-            if device_ids is None:
-                device_ids = [0]  # Default
-            
-            # Force Python garbage collection first
-            gc.collect()
-            
-            total_freed = 0
-            for device_id in device_ids:
-                with cp.cuda.Device(device_id):
-                    # Get memory pool and free all blocks
-                    mempool = cp.get_default_memory_pool()
-                    pinned_mempool = cp.get_default_pinned_memory_pool()
-                    
-                    # Get memory stats before cleanup
-                    used_before = mempool.used_bytes()
-                    
-                    # Free all blocks (including device and pinned memory)
-                    mempool.free_all_blocks()
-                    pinned_mempool.free_all_blocks()
-                    
-                    # Get memory stats after cleanup
-                    used_after = mempool.used_bytes()
-                    freed = used_before - used_after
-                    total_freed += freed
-                    
-            # Force synchronization to ensure cleanup is complete
-            cp.cuda.Device(0).synchronize()
-            
-            if total_freed > 0:
-                print(f"  GPU memory freed: {total_freed / 1024**3:.2f} GB")
-        except Exception as e:
-            print(f"  Warning: GPU memory cleanup failed: {e}")
-    
-    @staticmethod
-    def _print_gpu_memory_stats(device_ids=None, label=""):
-        """Print GPU memory statistics for debugging.
-        
-        Args:
-            device_ids: List of device IDs to check
-            label: Label to print with the stats
-        """
-        try:
-            import cupy as cp
-            if device_ids is None:
-                device_ids = [0]
-            
-            for device_id in device_ids:
-                with cp.cuda.Device(device_id):
-                    mempool = cp.get_default_memory_pool()
-                    free_mem, total_mem = cp.cuda.Device(device_id).mem_info
-                    
-                    used_bytes = mempool.used_bytes()
-                    total_bytes = mempool.total_bytes()
-                    
-                    print(f"  {label}GPU {device_id}: "
-                          f"Free: {free_mem/1024**3:.2f}GB, "
-                          f"Used: {used_bytes/1024**3:.2f}GB, "
-                          f"Pool: {total_bytes/1024**3:.2f}GB")
-        except Exception:
-            pass
-
-    def _filter_grid_gpu_multidevice(self, eff_atoms_pos, eff_radii_min, eff_radii_max,
-                                      base_xy, axis, nz, nx, ny, devices):
-        """
-        Multi-GPU grid filtering - distributes z-layers across multiple GPUs.
-        
-        Args:
-            devices: List of GPU device IDs to use
-        """
-        import cupy as cp
-        from concurrent.futures import ThreadPoolExecutor
-        
-        n_gpus = len(devices)
-        n_xy = nx * ny
-        n_total = n_xy * nz
-        
-        # Calculate how many z-layers per GPU
-        layers_per_gpu = nz // n_gpus
-        extra_layers = nz % n_gpus
-        
-        def process_gpu_layers(args):
-            device_id, z_start, z_end = args
-            with cp.cuda.Device(device_id):
-                n_atoms = len(eff_atoms_pos)
-                
-                # Use pinned memory for faster transfers
-                atoms_pos_pinned = cp.cuda.alloc_pinned_memory(eff_atoms_pos.nbytes)
-                atoms_pos_np = np.frombuffer(atoms_pos_pinned, dtype=eff_atoms_pos.dtype,
-                                             count=eff_atoms_pos.size).reshape(eff_atoms_pos.shape)
-                np.copyto(atoms_pos_np, eff_atoms_pos)
-                
-                radii_min_pinned = cp.cuda.alloc_pinned_memory(eff_radii_min.nbytes)
-                radii_min_np = np.frombuffer(radii_min_pinned, dtype=eff_radii_min.dtype,
-                                             count=eff_radii_min.size)
-                np.copyto(radii_min_np, eff_radii_min)
-                
-                radii_max_pinned = cp.cuda.alloc_pinned_memory(eff_radii_max.nbytes)
-                radii_max_np = np.frombuffer(radii_max_pinned, dtype=eff_radii_max.dtype,
-                                             count=eff_radii_max.size)
-                np.copyto(radii_max_np, eff_radii_max)
-                
-                base_xy_pinned = cp.cuda.alloc_pinned_memory(base_xy.nbytes)
-                base_xy_np = np.frombuffer(base_xy_pinned, dtype=base_xy.dtype,
-                                           count=base_xy.size).reshape(base_xy.shape)
-                np.copyto(base_xy_np, base_xy)
-                
-                z_vec_pinned = cp.cuda.alloc_pinned_memory(axis[2].nbytes)
-                z_vec_np = np.frombuffer(z_vec_pinned, dtype=axis[2].dtype,
-                                         count=axis[2].size)
-                np.copyto(z_vec_np, axis[2])
-                
-                # Transfer data to this GPU from pinned memory
-                atoms_pos_gpu = cp.asarray(atoms_pos_np, dtype=cp.float64)
-                radii_min_gpu = cp.asarray(radii_min_np, dtype=cp.float64)
-                radii_max_gpu = cp.asarray(radii_max_np, dtype=cp.float64)
-                base_xy_gpu = cp.asarray(base_xy_np, dtype=cp.float64)
-                z_vec = cp.asarray(z_vec_np, dtype=cp.float64)
-                atoms_norm = cp.sum(atoms_pos_gpu ** 2, axis=1)
-                
-                n_z_local = z_end - z_start
-                n_points_local = n_z_local * n_xy
-                
-                valid_mask_local = np.empty(n_points_local, dtype=bool)
-                near_mask_local = np.empty(n_points_local, dtype=bool)
-                
-                # Process in chunks if needed
-                free_mem = cp.cuda.Device(device_id).mem_info[0]
-                bytes_per_point = 24 + 8 * n_atoms * 2
-                chunk_z = max(1, int((free_mem * 0.5 / bytes_per_point) / n_xy))
-                
-                for local_z_start in range(0, n_z_local, chunk_z):
-                    local_z_end = min(local_z_start + chunk_z, n_z_local)
-                    actual_z_start = z_start + local_z_start
-                    actual_z_end = z_start + local_z_end
-                    
-                    z_range = cp.arange(actual_z_start, actual_z_end, dtype=cp.float64)
-                    z_grid = z_range[:, None] * z_vec[None, :]
-                    grid_pos = base_xy_gpu[None, :, :] + z_grid[:, None, :]
-                    grid_pos = grid_pos.reshape(-1, 3)
-                    
-                    grid_norm = cp.sum(grid_pos ** 2, axis=1, keepdims=True)
-                    dot_product = grid_pos @ atoms_pos_gpu.T
-                    dists_sq = grid_norm + atoms_norm - 2 * dot_product
-                    dists = cp.sqrt(cp.maximum(dists_sq, 0))
-                    
-                    valid_mask = cp.all(dists > radii_min_gpu[None, :], axis=1)
-                    near_mask = cp.any(dists <= radii_max_gpu[None, :], axis=1)
-                    
-                    start_idx = local_z_start * n_xy
-                    end_idx = local_z_end * n_xy
-                    valid_mask_local[start_idx:end_idx] = valid_mask.get()
-                    near_mask_local[start_idx:end_idx] = near_mask.get()
-                    
-                    del grid_pos, grid_norm, dot_product, dists_sq, dists, valid_mask, near_mask
-                
-                # Clean up GPU memory before returning from this device
-                del atoms_pos_gpu, radii_min_gpu, radii_max_gpu
-                del base_xy_gpu, z_vec, atoms_norm
-                cp.get_default_memory_pool().free_all_blocks()
-                
-                # Clean up pinned memory
-                del atoms_pos_pinned, radii_min_pinned, radii_max_pinned
-                del base_xy_pinned, z_vec_pinned
-                
-                return device_id, z_start, z_end, valid_mask_local, near_mask_local
-        
-        # Prepare tasks for each GPU
-        tasks = []
-        z_offset = 0
-        for i, device_id in enumerate(devices):
-            n_layers = layers_per_gpu + (1 if i < extra_layers else 0)
-            if n_layers > 0:
-                tasks.append((device_id, z_offset, z_offset + n_layers))
-                z_offset += n_layers
-        
-        print(f"  Distributing {nz} z-layers across {len(tasks)} GPUs: {[t[0] for t in tasks]}")
-        
-        # Execute on all GPUs in parallel using threads
-        results = []
-        with ThreadPoolExecutor(max_workers=len(tasks)) as executor:
-            futures = [executor.submit(process_gpu_layers, task) for task in tasks]
-            for future in futures:
-                results.append(future.result())
-        
-        # Combine results in correct order
-        valid_mask_all = np.empty(n_total, dtype=bool)
-        near_mask_all = np.empty(n_total, dtype=bool)
-        
-        for device_id, z_start, z_end, valid_local, near_local in results:
-            start_idx = z_start * n_xy
-            end_idx = z_end * n_xy
-            valid_mask_all[start_idx:end_idx] = valid_local
-            near_mask_all[start_idx:end_idx] = near_local
-        
-        return valid_mask_all, near_mask_all
-
     def _filter_grid(self):
+        """
+        Grid filtering (optimized):
+        - Do NOT build full grid_pos for all points
+        - Build keep mask (GPU bins preferred; CPU fallback)
+        - Convert kept flat indices -> (i,j,k) -> grid_pos only for kept points
+        """
         cube = self.cube
         n_grid = cube["n_grid"]
         axis = cube["axis_vector"]
-        nx, ny, nz = n_grid[0], n_grid[1], n_grid[2]
+        nx, ny, nz = int(n_grid[0]), int(n_grid[1]), int(n_grid[2])
         n_total = nx * ny * nz
 
         atom_indices = np.array(cube["atom_index"], dtype=int) - 1
         raw_radii = np.array([VDW_RADII[idx] for idx in atom_indices], dtype=np.float64)
         vdw_radii = self.vdw_factor * raw_radii
         vdw_rmax = self.vdw_max * raw_radii
-        
+
         atom_pos_base = np.asarray(cube["atom_pos"], dtype=np.float64)
         neigh_shifts = self._neighbor_shifts_27
-        
+
         corners_iter = itertools.product([0, 1], repeat=3)
-        box_corners = np.dot(np.array(list(corners_iter)), axis)
+        box_corners = np.dot(np.array(list(corners_iter), dtype=np.float64), axis)
         box_min, box_max = np.min(box_corners, axis=0), np.max(box_corners, axis=0)
-        
-        global_max_r = np.max(vdw_rmax) if len(vdw_rmax) > 0 else 5.0
+
+        global_max_r = float(np.max(vdw_rmax)) if len(vdw_rmax) > 0 else 5.0
         safe_margin = global_max_r + 0.1
         limit_min, limit_max = box_min - safe_margin, box_max + safe_margin
-        
+
         all_atoms_pos = (atom_pos_base[:, None, :] + neigh_shifts[None, :, :]).reshape(-1, 3)
         all_radii_min = np.repeat(vdw_radii, len(neigh_shifts))
         all_radii_max = np.repeat(vdw_rmax, len(neigh_shifts))
-        
+
         in_bound_mask = (
             (all_atoms_pos[:, 0] >= limit_min[0]) & (all_atoms_pos[:, 0] <= limit_max[0]) &
             (all_atoms_pos[:, 1] >= limit_min[1]) & (all_atoms_pos[:, 1] <= limit_max[1]) &
             (all_atoms_pos[:, 2] >= limit_min[2]) & (all_atoms_pos[:, 2] <= limit_max[2])
         )
-        
         eff_atoms_pos = all_atoms_pos[in_bound_mask]
         eff_radii_min = all_radii_min[in_bound_mask]
         eff_radii_max = all_radii_max[in_bound_mask]
-        
+
         print(f"Grid Points: {n_total}, Effective Atoms: {len(eff_atoms_pos)}")
 
-        j_range = np.arange(ny)
-        i_range = np.arange(nx)
-        j_grid, i_grid = np.meshgrid(j_range, i_range, indexing='ij')
-        
-        base_xy = np.zeros((nx * ny, 3), dtype=np.float64)
-        base_xy[:, 0] = i_grid.flatten() * axis[0][0] + j_grid.flatten() * axis[1][0]
-        base_xy[:, 1] = i_grid.flatten() * axis[0][1] + j_grid.flatten() * axis[1][1]
-        base_xy[:, 2] = i_grid.flatten() * axis[0][2] + j_grid.flatten() * axis[1][2]
+        # Precompute base_xy for CPU fallback
+        j_range = np.arange(ny, dtype=np.int32)
+        i_range = np.arange(nx, dtype=np.int32)
+        j_grid, i_grid = np.meshgrid(j_range, i_range, indexing="ij")
 
-        # Try GPU first for large grids
+        base_xy = np.zeros((nx * ny, 3), dtype=np.float64)
+        ig = i_grid.ravel()
+        jg = j_grid.ravel()
+        base_xy[:, 0] = ig * axis[0][0] + jg * axis[1][0]
+        base_xy[:, 1] = ig * axis[0][1] + jg * axis[1][1]
+        base_xy[:, 2] = ig * axis[0][2] + jg * axis[1][2]
+
         valid_mask_all = None
         near_mask_all = None
-        if _GPU_CONFIG['enabled'] and _GPU_INFO['available'] and n_total >= 100000:
-            devices = _GPU_CONFIG['devices']
-            n_gpus = len(devices)
-            
-            if n_gpus == 1:
-                print(f"  Using single GPU (device {devices[0]}) for grid filtering...")
-            else:
-                print(f"  Using {n_gpus} GPUs {devices} for grid filtering...")
-            
+
+        if _GPU_CONFIG["enabled"] and _GPU_INFO["available"] and _GPU_INFO.get("cupy_available", False) and n_total >= 100000:
+            devices = _GPU_CONFIG["devices"]
+            device_id = devices[0]
+            print(f"  Using CuPy bins GPU filter on device {device_id}...")
+
             try:
-                if n_gpus == 1:
-                    # Single GPU mode
-                    valid_mask_all, near_mask_all, _ = self._filter_grid_gpu_single(
-                        eff_atoms_pos, eff_radii_min, eff_radii_max,
-                        base_xy, axis, nz, nx, ny, device_id=devices[0]
-                    )
-                else:
-                    # Multi-GPU mode - distribute work across devices
-                    valid_mask_all, near_mask_all = self._filter_grid_gpu_multidevice(
-                        eff_atoms_pos, eff_radii_min, eff_radii_max,
-                        base_xy, axis, nz, nx, ny, devices
-                    )
-                
-                # Clean up GPU memory after filtering
-                if valid_mask_all is not None:
-                    print(f"  Cleaning up GPU memory...")
-                    self._cleanup_gpu_memory(device_ids=devices)
-                    print(f"  GPU memory cleaned up successfully")
-                    
+                (eff_x, eff_y, eff_z, eff_rmin2, eff_rmax2,
+                 bin_min, bin_size, bnx, bny, bnz,
+                 offsets, indices) = _build_effective_atoms_and_bins(
+                    atom_pos_base=np.asarray(cube["atom_pos"], dtype=np.float64),
+                    box_vectors=self.box_vectors,
+                    vdw_radii=vdw_radii,
+                    vdw_rmax=vdw_rmax,
+                    axis=axis,
+                    origin=np.zeros(3, dtype=np.float64),
+                )
+
+                keep_u8 = _gpu_filter_mask_bins_cupy(
+                    nx, ny, nz,
+                    origin=np.zeros(3, dtype=np.float64),
+                    ax0=axis[0], ax1=axis[1], ax2=axis[2],
+                    bin_min=bin_min, bin_size=bin_size,
+                    bnx=bnx, bny=bny, bnz=bnz,
+                    offsets=offsets, indices=indices,
+                    eff_x=eff_x, eff_y=eff_y, eff_z=eff_z,
+                    rmin2=eff_rmin2, rmax2=eff_rmax2,
+                    device_id=device_id
+                )
+
+                keep_cpu = keep_u8.get().astype(bool, copy=False)
+                valid_mask_all = keep_cpu
+                near_mask_all = keep_cpu
+
+                print(f"  GPU bins filter done. Kept {int(np.sum(keep_cpu))}/{n_total} points")
+
+                try:
+                    import cupy as cp
+                    with cp.cuda.Device(device_id):
+                        cp.get_default_memory_pool().free_all_blocks()
+                        cp.get_default_pinned_memory_pool().free_all_blocks()
+                except Exception:
+                    pass
+
             except Exception as e:
-                print(f"    GPU filtering failed: {e}, falling back to CPU...")
+                print(f"    CuPy bins GPU filtering failed: {e}, falling back to CPU...")
                 valid_mask_all = None
                 near_mask_all = None
-        
+
         if valid_mask_all is None:
-            # Fall back to CPU processing
             MULTIPROCESS_THRESHOLD = 50000
             worker_args_template = {
-                'n_grid': n_grid, 'axis': axis, 
-                'atoms_pos': eff_atoms_pos, 
-                'r_min': eff_radii_min, 'r_max': eff_radii_max, 
-                'max_r': global_max_r, 'base_xy': base_xy
+                "n_grid": n_grid,
+                "axis": axis,
+                "atoms_pos": eff_atoms_pos,
+                "r_min": eff_radii_min,
+                "r_max": eff_radii_max,
+                "max_r": global_max_r,
+                "base_xy": base_xy,
             }
 
             if n_total < MULTIPROCESS_THRESHOLD:
-                valid_mask_all, near_mask_all = self._process_layer_chunk(
-                    (0, nz, worker_args_template)
-                )
+                valid_mask_all, near_mask_all = self._process_layer_chunk((0, nz, worker_args_template))
             else:
-                # Use optimized parallel backend
                 use_threads = _NOGIL_ENABLED
                 effective_cores = _get_optimal_workers(self.n_cores)
-                n_workers = min(int(n_total / MULTIPROCESS_THRESHOLD),
-                              max(1, min(effective_cores, nz)))
-                
+                n_workers = min(int(n_total / MULTIPROCESS_THRESHOLD), max(1, min(effective_cores, nz)))
+
                 chunk_size = (nz + n_workers - 1) // n_workers
                 print(f"Using {n_workers} {'threads' if use_threads else 'processes'} for grid filtering (noGIL={_NOGIL_ENABLED})")
-                
+
                 tasks = []
-                for i in range(n_workers):
-                    z_start = i * chunk_size
-                    z_end = min((i + 1) * chunk_size, nz)
-                    if z_start >= z_end: 
+                for w in range(n_workers):
+                    z_start = w * chunk_size
+                    z_end = min((w + 1) * chunk_size, nz)
+                    if z_start >= z_end:
                         break
                     tasks.append((z_start, z_end, worker_args_template))
-                
-                # Execute with appropriate backend
+
+                _maybe_limit_blas_threads(enable=True)
+
                 if use_threads and _NOGIL_ENABLED:
-                    # Thread-based execution for noGIL Python
                     with ThreadPoolExecutor(max_workers=n_workers) as executor:
-                        futures = [executor.submit(self._process_layer_chunk, task) 
-                                  for task in tasks]
-                        results = [f.result() for f in futures]
+                        results = [f.result() for f in (executor.submit(self._process_layer_chunk, t) for t in tasks)]
                 else:
-                    # Process-based execution for standard Python
                     from multiprocessing import get_context
                     try:
-                        ctx = get_context('spawn')
-                    except:
+                        ctx = get_context("spawn")
+                    except Exception:
                         ctx = get_context()
-                        
+
                     with ctx.Pool(processes=n_workers) as pool:
-                        results = pool.map(self._process_layer_chunk, tasks)
-                        results = list(results)  # Convert iterator to list
-                    
+                        results = list(pool.map(self._process_layer_chunk, tasks))
+
                 valid_mask_all = np.concatenate([r[0] for r in results])
                 near_mask_all = np.concatenate([r[1] for r in results])
 
         final_mask = valid_mask_all & near_mask_all
         flat_indices = np.flatnonzero(final_mask)
-        
-        V_pot_flat = cube["V_pot"].flatten(order='F')
-        V_pot_filtered = V_pot_flat[final_mask]
-        
+
+        V_pot_flat = cube["V_pot"].ravel(order="F")
+        V_pot_filtered = V_pot_flat[flat_indices]
+
         layer_size = nx * ny
         k_idx = flat_indices // layer_size
-        rem = flat_indices % layer_size
+        rem = flat_indices - k_idx * layer_size
         j_idx = rem // nx
-        i_idx = rem % nx
-        
-        grid_pos_final = (
-            i_idx[:, None] * axis[0] + 
-            j_idx[:, None] * axis[1] + 
-            k_idx[:, None] * axis[2]
-        )
-        
+        i_idx = rem - j_idx * nx
+
+        n_keep = len(i_idx)
+        grid_pos_final = np.empty((n_keep, 3), dtype=np.float64)
+
+        grid_pos_final[:] = axis[0]
+        grid_pos_final *= i_idx[:, None]
+
+        grid_pos_final += axis[1] * j_idx[:, None]
+        grid_pos_final += axis[2] * k_idx[:, None]
+
+        V_pot_filtered = V_pot_filtered.astype(np.float64, copy=False)
         return grid_pos_final, (V_pot_filtered - np.mean(V_pot_filtered))
 
     @staticmethod
@@ -2297,34 +1848,34 @@ class ChargeCalculator:
         r_max = params['r_max']
         max_r = params['max_r']
         base_xy = params['base_xy']
-        
+
         nx, ny = n_grid[0], n_grid[1]
         layer_size = nx * ny
         n_layers = z_end - z_start
         total_points = n_layers * layer_size
-        
+
         chunk_valid = np.empty(total_points, dtype=bool)
         chunk_near = np.empty(total_points, dtype=bool)
-        
+
         MEM_LIMIT_BYTES = 512 * 1024 * 1024
         n_atoms = len(atoms_pos)
         if n_atoms > 0:
             batch_size = max(1, MEM_LIMIT_BYTES // (n_atoms * 8))
         else:
             batch_size = total_points
-            
+
         z_vec = axis[2]
-        
+
         for start_idx in range(0, total_points, batch_size):
             end_idx = min(start_idx + batch_size, total_points)
-            
+
             batch_indices = np.arange(start_idx, end_idx)
             k_local = batch_indices // layer_size
             xy_indices = batch_indices % layer_size
             k_global = z_start + k_local
-            
+
             batch_coords = base_xy[xy_indices] + (k_global[:, None] * z_vec)
-            
+
             if n_atoms == 0:
                 chunk_valid[start_idx:end_idx] = True
                 chunk_near[start_idx:end_idx] = False
@@ -2336,17 +1887,17 @@ class ChargeCalculator:
             z_height_max = max_k * z_vec[2]
             mid_z = (z_height_min + z_height_max) / 2.0
             half_height = (z_height_max - z_height_min) / 2.0
-            
+
             z_mask = np.abs(atoms_pos[:, 2] - mid_z) < (half_height + max_r + 1.0)
             local_atoms = atoms_pos[z_mask]
             local_rmin = r_min[z_mask]
             local_rmax = r_max[z_mask]
-            
+
             if len(local_atoms) == 0:
                 chunk_valid[start_idx:end_idx] = True
                 chunk_near[start_idx:end_idx] = False
                 continue
-                
+
             dists = cdist(batch_coords, local_atoms)
             chunk_valid[start_idx:end_idx] = np.all(dists > local_rmin, axis=1)
             chunk_near[start_idx:end_idx] = np.any(dists <= local_rmax, axis=1)
@@ -2355,7 +1906,6 @@ class ChargeCalculator:
         return chunk_valid, chunk_near
 
     # -------------------- Fit Logic (Streaming) --------------------
-
     def fit_charges(self):
         """
         Fit charges using streaming Grid Chunking to avoid OOM.
@@ -2363,40 +1913,29 @@ class ChargeCalculator:
         """
         n_atoms_orig = self.cube["n_atoms"]
         n_grid_total = len(self.grid_pos)
-        
+
         print(f"Computing interaction matrix using {self.ewald.n_cores} cores...")
         t0 = time.time()
-        
-        # 1. Determine safe chunk size based on available memory
+
         if psutil:
             avail_mem = psutil.virtual_memory().available
         else:
-            avail_mem = 4 * 1024 * 1024 * 1024 # 4GB fallback
-            
-        # We need to store phi_chunk (chunk_size * n_atoms * 8 bytes)
-        # Allow using 40% of available RAM for the buffer
+            avail_mem = 4 * 1024 * 1024 * 1024
+
         safe_mem = avail_mem * 0.4
         bytes_per_row = n_atoms_orig * 8
         chunk_size = int(safe_mem // max(1, bytes_per_row))
-        # Cap chunk size to avoid excessive process creation overhead or too large chunks
         chunk_size = max(100, min(chunk_size, 200000))
-        
+
         print(f"  Grid total: {n_grid_total}, Chunk size: {chunk_size}")
 
-        # 2. Initialize accumulators for Least Squares
-        # A = (Phi - Phi_bar).T @ (Phi - Phi_bar)
-        # b = (Phi - Phi_bar).T @ V_pot
-        # We accumulate: ATA = Phi.T @ Phi, ATb = Phi.T @ V, sum_phi, sum_V
         ATA = np.zeros((n_atoms_orig, n_atoms_orig), dtype=np.float64)
         ATb = np.zeros(n_atoms_orig, dtype=np.float64)
         sum_phi = np.zeros(n_atoms_orig, dtype=np.float64)
         sum_V = 0.0
-        
-        # For statistics optimization: save sum_phi to avoid recomputation
-        # Memory: n_atoms doubles (negligible)
-        self._sum_phi = None  # Will be set at the end
-        
-        # Check if we have enough memory to save full Phi matrix for stats
+
+        self._sum_phi = None
+
         phi_matrix_bytes = n_grid_total * n_atoms_orig * 8
         if psutil and phi_matrix_bytes < psutil.virtual_memory().available * 0.5:
             print(f"  Saving Phi matrix for statistics ({phi_matrix_bytes/1024**3:.2f} GB)")
@@ -2405,52 +1944,38 @@ class ChargeCalculator:
         else:
             self._phi_matrix = None
             save_phi = False
-        
-        # 3. Stream loop
+
         for start in range(0, n_grid_total, chunk_size):
             end = min(start + chunk_size, n_grid_total)
             grid_chunk = self.grid_pos[start:end]
             V_chunk = self.V_pot[start:end]
-            
-            # Compute partial Phi matrix
-            # progress=False to avoid spamming bars for every chunk
+
             phi_chunk = self.ewald.compute_batch_parallel(
                 grid_chunk, self.cube["atom_pos"], progress=False
             )
-            
-            # Accumulate
+
             ATA += phi_chunk.T @ phi_chunk
             ATb += phi_chunk.T @ V_chunk
             sum_phi += np.sum(phi_chunk, axis=0)
             sum_V += np.sum(V_chunk)
-            
-            # Save to Phi matrix if memory allows
+
             if save_phi:
                 self._phi_matrix[start:end, :] = phi_chunk
-            
-            # Progress indicator
+
             if (start // chunk_size) % 5 == 0 or end == n_grid_total:
                 print(f"    Processed {end}/{n_grid_total} grid points...", flush=True)
-            
-            # Explicitly free memory (only if not saved)
+
             if not save_phi:
                 del phi_chunk
 
         print(f"  Ewald streaming completed in {time.time() - t0:.2f} seconds")
 
-        # 4. Finalize A and b with mean subtraction
-        # A = ATA - (1/N) * S_phi.T @ S_phi
         phi_bar = sum_phi / n_grid_total
         V_bar = sum_V / n_grid_total
-        
-        # Correct A: A = ATA - N * outer(phi_bar, phi_bar)
+
         A = ATA - n_grid_total * np.outer(phi_bar, phi_bar)
-        
-        # Correct b: b = ATb - sum_phi * V_bar - phi_bar * sum_V + N * phi_bar * V_bar
-        # Simplifies to: b = ATb - N * phi_bar * V_bar
         b = ATb - n_grid_total * phi_bar * V_bar
 
-        # 5. Apply Constraints & Solve
         weights = np.ones(n_atoms_orig, dtype=np.float64)
         atom_types = self.cube["atom_index"].copy()
 
@@ -2483,68 +2008,48 @@ class ChargeCalculator:
         except np.linalg.LinAlgError:
             print("Warning: Matrix singular, using least squares fallback.")
             solution = np.linalg.lstsq(A_solv, b_solv, rcond=None)[0]
-            
+
         charges_reduced = solution[:n_atoms]
         charges = self._expand_charges(charges_reduced) if self.symm_data else charges_reduced
-        
-        # Save sum_phi for statistics optimization
-        # Expand if symmetry was applied
+
         if self.symm_data:
-            # Need to expand sum_phi to full atom set
             self._sum_phi = self._expand_sum_phi(sum_phi)
         else:
             self._sum_phi = sum_phi
         self._sum_V = sum_V
-        
+
         return charges
 
     def compute_stats(self, charges, need_v_coul=True):
-        """
-        Compute RMS error using streaming to avoid reconstructing full Phi matrix.
-        
-        Args:
-            charges: Fitted atomic charges
-            need_v_coul: If True, compute and return full V_coul array (for output file)
-                        If False, only compute statistics (saves memory)
-        
-        Returns:
-            dict with 'rms_error', 'avrg_qm', 'avrg_coul', and optionally 'V_coul'
-        """
+        """Compute RMS error using streaming to avoid reconstructing full Phi matrix."""
         print("Computing statistics ...")
         n_grid_total = len(self.grid_pos)
-        
-        # Check if we have pre-computed sum_phi from fit_charges
-        # This avoids recomputing the mean
+
         if hasattr(self, '_sum_phi') and self._sum_phi is not None:
-            # Fast path: use saved sum_phi
             avrg_coul = float(self._sum_phi @ charges) / n_grid_total
             print(f"  Using pre-computed sum_phi (fast path)")
         else:
-            avrg_coul = None  # Will compute from stream
+            avrg_coul = None
             print(f"  Warning: sum_phi not available, computing from stream")
-        
+
         avrg_qm = np.mean(self.V_pot)
-        
-        # Same chunking logic
+
         if psutil:
             avail_mem = psutil.virtual_memory().available
         else:
             avail_mem = 4 * 1024 * 1024 * 1024
-        
+
         bytes_per_row = self.n_atoms * 8
         chunk_size = int((avail_mem * 0.4) // max(1, bytes_per_row))
         chunk_size = max(100, min(chunk_size, 200000))
-        
-        # Allocate V_coul only if needed
+
         if need_v_coul:
             V_coul_all = np.zeros(n_grid_total, dtype=np.float64)
         else:
             V_coul_all = None
-        
-        # Stream computation with RMS accumulation
+
         sum_squared_diff = 0.0
-        
-        # Check if we have pre-computed Phi matrix from fit_charges
+
         if hasattr(self, '_phi_matrix') and self._phi_matrix is not None:
             print(f"  Using pre-computed Phi matrix (fast path)")
             phi_matrix = self._phi_matrix
@@ -2552,46 +2057,35 @@ class ChargeCalculator:
         else:
             print(f"  Computing Phi matrix on-the-fly...")
             use_precomputed = False
-        
+
         for start in range(0, n_grid_total, chunk_size):
             end = min(start + chunk_size, n_grid_total)
-            
+
             if use_precomputed:
-                # Fast path: directly slice from saved Phi matrix
                 phi_chunk = phi_matrix[start:end, :]
             else:
-                # Slow path: compute Ewald potential
                 grid_chunk = self.grid_pos[start:end]
                 phi_chunk = self.ewald.compute_batch_parallel(
                     grid_chunk, self.cube["atom_pos"], progress=False
                 )
-            
+
             v_coul_chunk = phi_chunk @ charges
-            
+
             if need_v_coul:
                 V_coul_all[start:end] = v_coul_chunk
-            
-            # Accumulate squared differences for RMS
-            # V_diff = (V_coul - avrg_coul) - (V_qm - avrg_qm)
+
             v_qm_chunk = self.V_pot[start:end]
             if avrg_coul is not None:
-                # Use pre-computed mean
                 diff_chunk = (v_coul_chunk - avrg_coul) - (v_qm_chunk - avrg_qm)
             else:
-                # Will need to compute mean later
                 diff_chunk = v_coul_chunk - v_qm_chunk
             sum_squared_diff += np.sum(diff_chunk ** 2)
-            
+
             del phi_chunk
-        
-        # Compute RMS
+
         if avrg_coul is None:
-            # Need to compute mean from accumulated data
-            # This requires another pass or storing all data
-            # For now, fall back to computing mean from V_coul_all if we have it
             if V_coul_all is not None:
                 avrg_coul = np.mean(V_coul_all)
-                # Recompute with correct mean
                 sum_squared_diff = 0.0
                 for start in range(0, n_grid_total, chunk_size):
                     end = min(start + chunk_size, n_grid_total)
@@ -2601,22 +2095,21 @@ class ChargeCalculator:
                     sum_squared_diff += np.sum(diff_chunk ** 2)
             else:
                 raise RuntimeError("Cannot compute statistics without sum_phi or V_coul_all")
-        
+
         rms_error = float(np.sqrt(sum_squared_diff / n_grid_total))
-        
+
         result = {
             'rms_error': rms_error,
             'avrg_qm': float(avrg_qm),
             'avrg_coul': float(avrg_coul),
         }
-        
+
         if need_v_coul:
             result['V_coul'] = V_coul_all
-        
+
         return result
 
     # -------------------- Constraints Helpers (Unchanged) --------------------
-
     def _apply_symmetry(self, A, b, weights, atom_types):
         trees = self.symm_data['trees']
         n_atoms_orig = self.cube["n_atoms"]
@@ -2667,16 +2160,16 @@ class ChargeCalculator:
         """Expand sum_phi from reduced set to full atom set for symmetry."""
         trees = self.symm_data['trees']
         n_atoms_orig = self.cube["n_atoms"]
-        
+
         linked_atoms = set()
         for tree in trees:
             linked_atoms.update(tree['linked'])
         independent = [i for i in range(n_atoms_orig) if i not in linked_atoms]
-        
+
         sum_phi = np.zeros(n_atoms_orig, dtype=np.float64)
         for i, idx in enumerate(independent):
             sum_phi[idx] = sum_phi_reduced[i]
-        
+
         for tree in trees:
             base = tree['base']
             for linked in tree['linked']:
@@ -2710,7 +2203,6 @@ class ChargeCalculator:
         return A, b
 
     # -------------------- QEq Calculation (Unchanged) --------------------
-
     def compute_qeq_charges(self, param_set=None):
         n_atoms = self.cube["n_atoms"]
         atom_pos = self.cube["atom_pos"]
@@ -2792,10 +2284,10 @@ class ChargeCalculator:
     def _ewald_pairwise(self, pos_i, pos_j):
         delta = pos_i - pos_j
         sqrt_alpha = self.ewald.sqrt_alpha
-        alpha = self.ewald.alpha
-        
+
         J_real = 0.0
-        for shift in self.ewald.shifts:
+        shifts = self.ewald.shifts_pruned if self.ewald.shifts_pruned is not None else self.ewald.shifts
+        for shift in shifts:
             r_vec = delta + shift
             r = np.linalg.norm(r_vec)
             if r > 1e-10:
@@ -2816,7 +2308,7 @@ def main():
 Performance Notes:
   - GPU Acceleration: Use --gpu to enable CUDA acceleration (requires CuPy or PyTorch)
   - Python 3.13+ with noGIL: Uses ThreadPoolExecutor (shared memory, zero serialization overhead)
-  - Standard Python: Uses ProcessPoolExecutor (isolated memory, higher overhead)
+  - Standard Python: Uses ProcessPoolExecutor (initializer caches large arrays, lower IPC cost)
   - Set REPEAT_PERF=1 environment variable to enable performance monitoring
   - Use --cores to control parallel workers (default: auto-detect)
 
@@ -2839,9 +2331,9 @@ GPU Support:
     parser.add_argument("--cores", type=int, default=None, help="Number of parallel workers (default: auto)")
     parser.add_argument("--block-k", type=int, default=64, help="Initial k blocking size")
     parser.add_argument("--no-jit", action="store_true", help="Disable Numba JIT")
-    parser.add_argument("--gpu", nargs='?', const='0', default=None, 
+    parser.add_argument("--gpu", nargs='?', const='0', default=None,
                         help="Enable GPU acceleration. Optional: device IDs (e.g., --gpu, --gpu 0, --gpu 0,1,2, --gpu all)")
-    parser.add_argument("--gpu-fp32", action="store_true", help="Use fp32 mixed precision for faster GPU computation")
+    parser.add_argument("--fp64", action="store_true", help="Use fp64 precision for GPU computation")
     parser.add_argument("--output", type=str, default=None)
     parser.add_argument("--charge", type=str, default="repeat", choices=["repeat", "qeq"],
                         help="Charge calculation method: repeat (default) or qeq")
@@ -2849,28 +2341,26 @@ GPU Support:
                         help="Compute statistics (RMS error). Disabled by default to save time.")
     args = parser.parse_args()
 
-    # Enable GPU if requested
     if args.gpu is not None:
         devices = parse_gpu_devices(args.gpu)
         if devices:
-            set_gpu_config(enabled=True, devices=devices, mixed_precision=args.gpu_fp32)
+            set_gpu_config(enabled=True, devices=devices, mixed_precision=not args.fp64)
         else:
             print("\nWARNING: GPU requested but no GPU backend available.")
             print("Install CuPy: pip install cupy-cuda11x (or appropriate CUDA version)")
             print("Or PyTorch: pip install torch")
             print("Continuing with CPU...\n")
 
-    # Print runtime info
-    cpu_count = os.cpu_count() or 4
-    print("="*60)
+    cpu_count = _get_physical_or_logical_cpu_count()
+    print("=" * 60)
     print("REPEAT - Multi-Core Optimized")
-    print("="*60)
+    print("=" * 60)
     print(f"Python: {sys.version.split()[0]}")
     print(f"noGIL Enabled: {_NOGIL_ENABLED}")
-    print(f"CPU Cores Available: {cpu_count}")
+    print(f"CPU Cores (pref physical): {cpu_count}")
     print(f"Optimal Workers: {_get_optimal_workers(args.cores)}")
     print(f"Numba JIT: {'Available' if _NUMBA_AVAILABLE else 'Not Available'}")
-    
+
     if _GPU_CONFIG['enabled']:
         device_names = []
         for d in _GPU_CONFIG['devices']:
@@ -2887,7 +2377,7 @@ GPU Support:
         print(f"GPU: Available ({_GPU_INFO['device_name']}, use --gpu to enable)")
     else:
         print(f"GPU: Not Available")
-    print("="*60)
+    print("=" * 60)
 
     if (not args.cube_file) or (not os.path.exists(args.cube_file)):
         print(f"Error: Cube file '{args.cube_file}' not found!")
@@ -2905,7 +2395,7 @@ GPU Support:
         qeq_file=args.qeq_file,
         n_cores=args.cores,
         block_k=args.block_k,
-        use_jit= not args.no_jit,
+        use_jit=not args.no_jit,
     )
 
     if args.charge == "qeq":
@@ -2937,9 +2427,7 @@ GPU Support:
 
         calc.ewald.block_k = args.block_k
         charges = calc.fit_charges()
-        
-        # Compute RMS stats only if explicitly requested
-        # This can be time-consuming for large systems
+
         if args.stats or args.output:
             print("\nComputing statistics...")
             stats = calc.compute_stats(charges, need_v_coul=args.output is not None)
@@ -2963,9 +2451,6 @@ GPU Support:
                     f.write(f"{grid_p[0]:12.6f} {grid_p[1]:12.6f} {grid_p[2]:12.6f} "
                             f"{v_coul:16.8e} {v_qm:16.8e}\n")
             print(f"Output written to {args.output}")
-    
-    # Print performance report if enabled
-    _perf_monitor.report()
 
 if __name__ == "__main__":
     main()
