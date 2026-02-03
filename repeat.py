@@ -5,17 +5,19 @@ Optimized for multi-core performance with noGIL support
 """
 
 import numpy as np
-from scipy import special, linalg
 import sys
 import argparse
 import time
 import os
 import itertools
 from scipy.spatial.distance import cdist
+from scipy import linalg, spatial
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 from functools import partial
-import threading
-import warnings
+import bz2
+import gzip
+import re
+import glob
 
 try:
     import psutil
@@ -647,6 +649,159 @@ DEFAULT_QEQ_PARAMS = {
     "Th": (0.113920, 0.161693),
 }
 
+
+# -------------------- VASP file reading utilities --------------------
+def compressed_open(filename):
+    """Return file objects for either compressed and uncompressed files"""
+    filename_list = glob.glob(filename) + glob.glob(filename + ".gz") + glob.glob(filename + ".bz2")
+    try:
+        filename = filename_list[0]
+    except IndexError:
+        raise FileNotFoundError(f"File {filename} not found")
+    if filename[-4:] == ".bz2":
+        return bz2.BZ2File(filename, 'rt')
+    elif filename[-3:] == ".gz":
+        return gzip.open(filename, 'rt')
+    else:
+        return open(filename, "r")
+
+def read_vasp_potential(filename):
+    """
+    Read VASP electrostatic potential file (LOCPOT) and return data in REPEAT cube format.
+    
+    Args:
+        filename: Path to LOCPOT file (supports .gz, .bz2 compression)
+        
+    Returns:
+        dict with keys: n_atoms, n_grid, atom_index, atom_pos, axis_vector, V_pot
+        (same format as _read_cube)
+    """
+    locpot = compressed_open(filename)
+    
+    # Top line identifies system -- compress spaces
+    name = re.sub(r'\s+', ' ', locpot.readline().strip())
+    
+    # Cube is in Bohr, so we can alter the scale here to account for it
+    scale = float(locpot.readline())
+    ANG_TO_BOHR = 1.889725985
+    scale = scale * ANG_TO_BOHR
+    
+    lattice = [[scale * float(i) for i in locpot.readline().split()]
+               for _ in ['a', 'b', 'c']]
+    
+    # Parse atom types and counts (adapted from vasp_to_cube_py3.py)
+    test_string = ''
+    for i in range(20):
+        test = locpot.readline()
+        if 'Direct' in test:
+            break
+        else:
+            test_string += test
+    test_string = "".join(test_string.splitlines())
+    test_string = test_string.split()
+    
+    types = []
+    atom_counts = []
+    for i in test_string:
+        if i.isalpha():
+            types.append(i)
+        elif i.isnumeric():
+            atom_counts.append(i)
+        else:
+            pass
+    
+    for i in range(len(atom_counts)):
+        atom_counts[i] = int(atom_counts[i])
+    
+    mcell = lattice
+    atoms = []
+    for _atom_idx in range(sum(atom_counts)):
+        coord = [float(x) for x in locpot.readline().split()]
+        # Convert fractional to Cartesian coordinates
+        coord = [mcell[0][0] * coord[0] + mcell[1][0] * coord[1] + mcell[2][0] * coord[2],
+                 mcell[0][1] * coord[0] + mcell[1][1] * coord[1] + mcell[2][1] * coord[2],
+                 mcell[0][2] * coord[0] + mcell[1][2] * coord[1] + mcell[2][2] * coord[2]]
+        atoms.append(coord)
+    
+    locpot.readline()  # Blank line
+    ngrid = [int(x) for x in locpot.readline().split()]
+    
+    # Read electrostatic potential data (in eV)
+    factor_e = -1 / 27.212  # Convert eV to Hartree (LOCPOT in eV)
+    v = [factor_e * float(x) for line in locpot for x in line.split()]
+    locpot.close()
+    
+    # Reshape potential data to match cube format (Fortran column-major order)
+    # Cube format: V_pot shape (nx * ny, nz)
+    nx, ny, nz = ngrid
+    V_pot = np.zeros((nx * ny, nz), dtype=np.float64)
+    
+    idx = 0
+    for iz in range(nz):
+        for iy in range(ny):
+            for ix in range(nx):
+                # VASP order: x fastest, then y, then z (same as cube)
+                V_pot[ix + iy * nx, iz] = v[idx]
+                idx += 1
+    
+    # Convert atom types to atomic indices (0-based)
+    atom_index = []
+    for atype, count in zip(types, atom_counts):
+        atomic_number = ATOM_SYMBOLS.index(atype) if atype in ATOM_SYMBOLS else 0
+        atom_index.extend([atomic_number] * count)
+    atom_index = np.array(atom_index, dtype=int)
+    
+    # Axis vectors for cube format (grid spacing vectors)
+    axis_vector = np.array([
+        [(x / ngrid[0]) for x in lattice[0]],
+        [(y / ngrid[1]) for y in lattice[1]],
+        [(z / ngrid[2]) for z in lattice[2]]
+    ], dtype=np.float64)
+    
+    return {
+        "n_atoms": len(atom_index),
+        "n_grid": np.array(ngrid, dtype=int),
+        "atom_index": atom_index,
+        "atom_pos": np.array(atoms, dtype=np.float64),
+        "axis_vector": axis_vector,
+        "V_pot": V_pot
+    }
+
+def read_gauss_cube(filename):
+    with open(filename, 'r') as f:
+        f.readline()
+        f.readline()
+        parts = f.readline().split()
+        n_atoms = int(parts[0])
+        n_grid = np.zeros(3, dtype=int)
+        axis_vector = np.zeros((3, 3))
+        for i in range(3):
+            parts = f.readline().split()
+            n_grid[i] = int(parts[0])
+            axis_vector[i] = [float(x) for x in parts[1:4]]
+        atom_index = np.zeros(n_atoms, dtype=int)
+        atom_pos = np.zeros((n_atoms, 3))
+        for i in range(n_atoms):
+            parts = f.readline().split()
+            atom_index[i] = int(parts[0])
+            atom_pos[i] = [float(x) for x in parts[2:5]]
+        data = [float(x) for line in f for x in line.split()]
+        V_pot = np.zeros((n_grid[0] * n_grid[1], n_grid[2]))
+        idx = 0
+        for i in range(n_grid[0]):
+            for j in range(n_grid[1]):
+                i_2d = i + j * n_grid[0]
+                for k in range(n_grid[2]):
+                    V_pot[i_2d, k] = data[idx]
+                    idx += 1
+    return {
+        "n_atoms": n_atoms,
+        "n_grid": n_grid,
+        "atom_index": atom_index,
+        "atom_pos": atom_pos,
+        "axis_vector": axis_vector,
+        "V_pot": V_pot
+    }
 # -------------------- memory-safe compute helpers --------------------
 
 def _make_neighbor_shifts_27(box_vectors: np.ndarray) -> np.ndarray:
@@ -807,7 +962,7 @@ def _real_space_sum(grid_pos, atom_pos, shifts, R_cutoff, sqrt_alpha, use_jit=Fa
         else:
             mask = (d <= R_cutoff)
         if np.any(mask):
-            phi_real[mask] += special.erfc(sqrt_alpha * d[mask]) / d[mask]
+            phi_real[mask] += spatial.erfc(sqrt_alpha * d[mask]) / d[mask]
     return phi_real
 
 def _reciprocal_sum_blocked(delta, kvecs, kcoefs, block_k=64, use_jit=False):
@@ -1043,8 +1198,6 @@ class EwaldCalculator:
     
     def _compute_gpu(self, grid_pos, atom_positions, progress=True):
         """Compute using GPU acceleration with multi-GPU and mixed precision support."""
-        import numpy as np
-        
         n_grid = len(grid_pos)
         n_atoms = len(atom_positions)
         devices = _GPU_CONFIG['devices']
@@ -1593,7 +1746,7 @@ class ChargeCalculator:
         self.resp_file = resp_file
         self.qeq_file = qeq_file
 
-        self.cube = self._read_cube(cube_file)
+        self.cube = self._read_data(cube_file)
         self.n_atoms = self.cube["n_atoms"]
 
         n_grid_total = int(np.prod(self.cube["n_grid"]))
@@ -1634,46 +1787,29 @@ class ChargeCalculator:
         
     # -------------------- IO (Unchanged) --------------------
 
-    def _read_cube(self, filename):
-        with open(filename, 'r') as f:
-            f.readline()
-            f.readline()
-
-            parts = f.readline().split()
-            n_atoms = int(parts[0])
-
-            n_grid = np.zeros(3, dtype=int)
-            axis_vector = np.zeros((3, 3))
-            for i in range(3):
-                parts = f.readline().split()
-                n_grid[i] = int(parts[0])
-                axis_vector[i] = [float(x) for x in parts[1:4]]
-
-            atom_index = np.zeros(n_atoms, dtype=int)
-            atom_pos = np.zeros((n_atoms, 3))
-            for i in range(n_atoms):
-                parts = f.readline().split()
-                atom_index[i] = int(parts[0])
-                atom_pos[i] = [float(x) for x in parts[2:5]]
-
-            data = [float(x) for line in f for x in line.split()]
-            V_pot = np.zeros((n_grid[0] * n_grid[1], n_grid[2]))
-            idx = 0
-            for i in range(n_grid[0]):
-                for j in range(n_grid[1]):
-                    i_2d = i + j * n_grid[0]
-                    for k in range(n_grid[2]):
-                        V_pot[i_2d, k] = data[idx]
-                        idx += 1
-
-        return {
-            "n_atoms": n_atoms,
-            "n_grid": n_grid,
-            "atom_index": atom_index,
-            "atom_pos": atom_pos,
-            "axis_vector": axis_vector,
-            "V_pot": V_pot
-        }
+    def _read_data(self, filename):
+        """
+        Read cube or VASP potential file, auto-detecting format.
+        
+        Args:
+            filename: Path to file (cube or VASP LOCPOT)
+            
+        Returns:
+            dict with cube structure
+        """
+        # Simple detection based on filename and content
+        basename = os.path.basename(filename).lower()
+        # Check for common VASP filenames
+        vasp_names = {'locpot', 'locpot.gz', 'locpot.bz2', 'locpot.z'}
+        if basename in vasp_names or 'locpot' in basename:
+            try:
+                return read_vasp_potential(filename)
+            except Exception as e:
+                print(f"Warning: Failed to read as VASP file: {e}")
+                print("Trying to read as cube file...")
+        
+        # Default to cube format
+        return read_gauss_cube(filename)
 
     def _parse_atom_ranges(self, range_str):
         """Parse atom range string like '1-5,9,10,15-18' to list of indices.
@@ -2488,7 +2624,7 @@ class ChargeCalculator:
             r_vec = delta + shift
             r = np.linalg.norm(r_vec)
             if r > 1e-10:
-                J_real += special.erfc(sqrt_alpha * r) / r
+                J_real += spatial.erfc(sqrt_alpha * r) / r
 
         J_recp = 0.0
         for kvec, kcoef in zip(self.ewald.kvecs, self.ewald.kcoefs):
